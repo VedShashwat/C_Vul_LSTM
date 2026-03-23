@@ -1,0 +1,26 @@
+data:
+  raw_dir: data/raw/diversevul
+  processed_dir: data/processed
+  max_seq_len: 500
+  vocab_size: 10000
+  train_ratio: 0.70
+  val_ratio: 0.15
+  test_ratio: 0.15
+
+model:
+  embed_dim: 128
+  hidden_size: 128
+  num_layers: 2
+  dropout: 0.3
+  attention_dim: 64
+
+training:
+  batch_size: 64
+  lr: 0.001
+  epochs: 20
+  patience: 4
+  grad_clip: 1.0
+  seed: 42
+  device: cuda
+
+results_dir: results/

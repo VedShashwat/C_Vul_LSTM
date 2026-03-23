@@ -1,0 +1,10 @@
+torch>=2.8.0
+datasets
+transformers
+scikit-learn
+matplotlib
+seaborn
+numpy
+pandas
+pyyaml
+tqdm
