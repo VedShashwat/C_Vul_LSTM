@@ -17,59 +17,139 @@ UNK_TOKEN = "<UNK>"
 STRING_TOKEN = "STRING_LIT"
 NUMBER_TOKEN = "NUM_LIT"
 
-PRESERVE_IDENTIFIERS = {
+_TOKEN_PATTERN = re.compile(
+    r"(?P<COMMENT>//[^\n]*|/\*.*?\*/)"
+    r"|(?P<STRING>\"(?:[^\"\\]|\\.)*\"|'(?:[^'\\]|\\.)*')"
+    r"|(?P<NUMBER>\b\d+(?:\.\d+)?(?:[eE][+-]?\d+)?[uUlLfF]*\b)"
+    r"|(?P<MULTIOP>->|<<|>>|<=|>=|==|!=|&&|\|\||[+\-*/%&|^]=|\+\+|--)"
+    r"|(?P<IDENT>[a-zA-Z_]\w*)"
+    r"|(?P<SINGLEOP>[{}()\[\];,.<>=+\-*/%&|^~!?:])",
+    re.DOTALL,
+)
+
+PRESERVE_EXACT = {
     "if",
     "else",
     "while",
     "for",
     "do",
     "return",
+    "break",
+    "continue",
+    "switch",
+    "case",
+    "default",
+    "goto",
+    "typedef",
+    "struct",
+    "union",
+    "enum",
+    "sizeof",
+    "typeof",
+    "static",
+    "extern",
+    "const",
+    "volatile",
+    "register",
+    "auto",
+    "inline",
     "int",
     "char",
     "void",
-    "struct",
-    "typedef",
-    "sizeof",
-    "malloc",
-    "free",
-    "memcpy",
-    "strcpy",
-    "sprintf",
+    "short",
+    "long",
+    "float",
+    "double",
+    "unsigned",
+    "signed",
     "gets",
+    "fgets",
+    "strcpy",
+    "strncpy",
+    "strcat",
+    "strncat",
+    "strcmp",
+    "strncmp",
+    "sprintf",
+    "snprintf",
+    "vsprintf",
+    "vsnprintf",
+    "printf",
+    "fprintf",
+    "scanf",
+    "sscanf",
+    "fscanf",
+    "memcpy",
+    "memmove",
+    "memset",
+    "memcmp",
+    "malloc",
+    "calloc",
+    "realloc",
+    "free",
+    "alloca",
+    "valloc",
+    "memalign",
+    "posix_memalign",
+    "read",
+    "write",
+    "recv",
+    "recvfrom",
+    "recvmsg",
+    "send",
+    "sendto",
+    "getenv",
+    "putenv",
+    "system",
+    "popen",
+    "execve",
+    "execl",
+    "execlp",
+    "open",
+    "fopen",
+    "fclose",
+    "fread",
+    "fwrite",
+    "fputs",
+    "strlen",
+    "strdup",
+    "strtok",
+    "atoi",
+    "atol",
+    "atof",
+    "strtol",
+    "strtoul",
+    "assert",
+    "abort",
+    "exit",
+    "_exit",
+    "longjmp",
+    "setjmp",
+    "mmap",
+    "munmap",
+    "mprotect",
+    "ioctl",
+    "fcntl",
+    "new",
+    "delete",
+    "NULL",
+    "nullptr",
+    "EOF",
+    "stdin",
+    "stdout",
+    "stderr",
     STRING_TOKEN,
     NUMBER_TOKEN,
 }
+
+PRESERVE_IDENTIFIERS = set(PRESERVE_EXACT)
+MIN_FREQ = 2
 
 COMMENT_PATTERN = re.compile(r"//.*?$|/\*.*?\*/", flags=re.MULTILINE | re.DOTALL)
 STRING_PATTERN = re.compile(r'"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'')
 NUMBER_PATTERN = re.compile(r"\b\d+(?:\.\d+)?\b")
 WHITESPACE_PATTERN = re.compile(r"\s+")
 IDENTIFIER_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
-
-MULTI_OPS = [
-    "->",
-    "++",
-    "--",
-    "<=",
-    ">=",
-    "==",
-    "!=",
-    "&&",
-    "||",
-    "+=",
-    "-=",
-    "*=",
-    "/=",
-    "%=",
-]
-
-MULTI_OP_PATTERN = "|".join(re.escape(op) for op in MULTI_OPS)
-TOKEN_PATTERN = re.compile(
-    rf"(?P<MULTI_OP>{MULTI_OP_PATTERN})"
-    r"|(?P<SINGLE_OP>[(){}\[\];,\.\+\-\*/%=<>&\|\^~!\?])"
-    r"|(?P<IDENT>[A-Za-z_][A-Za-z0-9_]*)"
-    r"|(?P<NUMBER>\d+(?:\.\d+)?)"
-)
 
 
 def clean_code(code: str) -> str:
@@ -82,13 +162,28 @@ def clean_code(code: str) -> str:
 
 def tokenize_code(code: str) -> List[str]:
     tokens: List[str] = []
-    for match in TOKEN_PATTERN.finditer(code):
-        group_name = match.lastgroup
-        token = match.group(0)
-        if group_name == "NUMBER":
+
+    for match in _TOKEN_PATTERN.finditer(code):
+        kind = match.lastgroup
+        val = match.group()
+
+        if kind == "COMMENT":
+            continue
+        if kind == "STRING":
+            tokens.append(STRING_TOKEN)
+            continue
+        if kind == "NUMBER":
             tokens.append(NUMBER_TOKEN)
-        else:
-            tokens.append(token)
+            continue
+        if kind == "MULTIOP" or kind == "SINGLEOP":
+            tokens.append(val)
+            continue
+        if kind == "IDENT":
+            if val in PRESERVE_EXACT:
+                tokens.append(val)
+            else:
+                tokens.append(val)
+
     return tokens
 
 
@@ -121,7 +216,6 @@ def normalize_identifiers(tokens: Sequence[str]) -> List[str]:
 def preprocess_tokens(code: str) -> List[str]:
     cleaned = clean_code(code)
     tokens = tokenize_code(cleaned)
-    tokens = normalize_identifiers(tokens)
     return tokens
 
 
@@ -131,7 +225,18 @@ def build_vocab(token_lists: Sequence[Sequence[str]], max_vocab_size: int) -> Di
         counter.update(tokens)
 
     vocab = {PAD_TOKEN: 0, UNK_TOKEN: 1}
-    for token, _ in counter.most_common(max_vocab_size - 2):
+
+    for token in sorted(PRESERVE_EXACT):
+        if len(vocab) >= max_vocab_size:
+            break
+        if token not in vocab:
+            vocab[token] = len(vocab)
+
+    for token, count in counter.most_common(max_vocab_size - 2):
+        if count < MIN_FREQ:
+            continue
+        if len(vocab) >= max_vocab_size:
+            break
         if token not in vocab:
             vocab[token] = len(vocab)
     return vocab

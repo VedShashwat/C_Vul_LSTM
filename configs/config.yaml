@@ -13,6 +13,9 @@ model:
   num_layers: 2
   dropout: 0.3
   attention_dim: 64
+  cnn_num_filters: 128
+  cnn_kernel_sizes: [3, 5, 7]
+  num_attention_heads: 4
 
 training:
   batch_size: 64
@@ -22,5 +25,10 @@ training:
   grad_clip: 1.0
   seed: 42
   device: cuda
+  use_focal_loss: true
+  focal_alpha: 0.75
+  focal_gamma: 3.0
+  use_warmup_cosine: true
+  oversample_factor: 5.0
 
 results_dir: results/

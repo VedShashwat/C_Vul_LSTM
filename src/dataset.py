@@ -24,20 +24,25 @@ def _load_split(processed_dir: str, split: str) -> Dict[str, torch.Tensor]:
     return torch.load(split_path)
 
 
-def _build_weighted_sampler(labels: torch.Tensor) -> WeightedRandomSampler:
+def _build_weighted_sampler(labels: torch.Tensor, oversample_factor: float = 3.0) -> WeightedRandomSampler:
     labels = labels.long()
-    n_total = labels.numel()
-    class_counts = torch.bincount(labels)
+    train_labels = labels.cpu().numpy().tolist()
+    n_safe = sum(1 for l in train_labels if l == 0)
+    n_vuln = sum(1 for l in train_labels if l == 1)
 
-    class_weights = torch.zeros_like(class_counts, dtype=torch.float)
-    for class_idx, count in enumerate(class_counts):
-        if count > 0:
-            class_weights[class_idx] = n_total / (len(class_counts) * count.float())
+    if n_vuln == 0:
+        weight_vuln = 1.0
+    else:
+        weight_vuln = (n_safe / n_vuln) * oversample_factor
+    weight_safe = 1.0
+    sample_weights = [weight_vuln if l == 1 else weight_safe for l in train_labels]
 
-    sample_weights = class_weights[labels]
+    print(f"Class distribution — Safe: {n_safe}, Vulnerable: {n_vuln}")
+    print(f"Effective sampling weight ratio vuln:safe = {weight_vuln:.1f}:1")
+
     sampler = WeightedRandomSampler(
-        weights=sample_weights.double().tolist(),
-        num_samples=n_total,
+        weights=sample_weights,
+        num_samples=len(train_labels),
         replacement=True,
     )
     return sampler
@@ -46,6 +51,7 @@ def _build_weighted_sampler(labels: torch.Tensor) -> WeightedRandomSampler:
 def get_dataloaders(config: Dict) -> Tuple[DataLoader, DataLoader, DataLoader]:
     processed_dir = config["data"]["processed_dir"]
     batch_size = int(config["training"]["batch_size"])
+    oversample_factor = float(config["training"].get("oversample_factor", 3.0))
 
     train_data = _load_split(processed_dir, "train")
     val_data = _load_split(processed_dir, "val")
@@ -55,7 +61,7 @@ def get_dataloaders(config: Dict) -> Tuple[DataLoader, DataLoader, DataLoader]:
     val_ds = VulnDataset(val_data["sequences"], val_data["labels"])
     test_ds = VulnDataset(test_data["sequences"], test_data["labels"])
 
-    train_sampler = _build_weighted_sampler(train_data["labels"])
+    train_sampler = _build_weighted_sampler(train_data["labels"], oversample_factor=oversample_factor)
 
     train_loader = DataLoader(
         train_ds,

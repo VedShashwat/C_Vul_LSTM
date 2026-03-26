@@ -5,6 +5,8 @@ from typing import Any, Dict, Optional
 
 import numpy as np
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 import yaml
 
 
@@ -72,3 +74,28 @@ def load_checkpoint(
         optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
 
     return checkpoint
+
+
+class FocalLoss(nn.Module):
+    """
+    Focal Loss for binary classification.
+    FL(p) = -alpha * (1 - p)^gamma * log(p)
+    Down-weights easy examples, focuses training on hard negatives.
+    alpha=0.25, gamma=2 are standard values from the original paper.
+    """
+
+    def __init__(self, alpha: float = 0.25, gamma: float = 2.0, reduction: str = "mean"):
+        super().__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+        self.reduction = reduction
+
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        bce = F.binary_cross_entropy_with_logits(logits, targets, reduction="none")
+        p = torch.sigmoid(logits)
+        p_t = p * targets + (1 - p) * (1 - targets)
+        focal_weight = self.alpha * (1 - p_t) ** self.gamma
+        loss = focal_weight * bce
+        if self.reduction == "mean":
+            return loss.mean()
+        return loss.sum()
