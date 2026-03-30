@@ -1,12 +1,24 @@
 # LSTM-Based C Vulnerability Detection
 
-This project implements a modular deep learning pipeline for binary vulnerability detection in C functions using the DiverseVul dataset.
+This repository contains a modular deep learning pipeline for binary vulnerability detection in C source code using DiverseVul.
 
-Implemented models:
+Current model suite:
 
-- Vanilla LSTM
-- Bi-LSTM
-- Bi-LSTM + Token Attention
+- `lstm` (Vanilla LSTM baseline)
+- `bilstm`
+- `bilstm_attn` (Bi-LSTM + token attention)
+- `cnn_bilstm`
+- `bilstm_multihead` (Bi-LSTM + multi-head self-attention)
+- `ensemble` (soft-voting across all 5 models)
+
+Dataset note:
+
+- The processed split is heavily imbalanced (~94.3% safe, ~5.7% vulnerable), so threshold tuning and weighted sampling are critical.
+
+Tokenizer/vocabulary note:
+
+- The tokenizer was rebuilt to preserve operators/delimiters and critical vulnerability APIs.
+- Vocabulary increased from `834` to `10000` tokens.
 
 ## Project Structure
 
@@ -59,18 +71,37 @@ The preprocessing pipeline filters C rows, samples up to ~18,000 examples, and c
 pip install -r requirements.txt
 ```
 
-## Run Full Pipeline
+## Run Pipeline
+
+Preprocess (rebuild vocab and tensors):
+
+```bash
+PYTHONPATH=. python src/preprocess.py
+```
+
+Train all models:
 
 ```bash
 python main.py
 ```
 
-Options:
+Train only newer models (load baseline checkpoints):
+
+```bash
+python main.py --only-new
+```
+
+Evaluation only (load checkpoints, tune thresholds on val, evaluate test):
+
+```bash
+python main.py --eval-only
+```
+
+Other options:
 
 ```bash
 python main.py --skip-preprocess
-python main.py --models lstm bilstm bilstm_attn
-python main.py --models bilstm_attn
+python main.py --models lstm bilstm bilstm_attn cnn_bilstm bilstm_multihead
 ```
 
 ## Inference
@@ -84,14 +115,21 @@ python inference.py --model bilstm --file path/to/snippet.c
 Predict from inline code:
 
 ```bash
-python inference.py --model bilstm_attn --code "void foo() { char buf[10]; gets(buf); }"
+python inference.py --model ensemble --code "char buf[10]; memcpy(buf, src, strlen(src));"
 ```
+
+Inference behavior:
+
+- If `--code` is a bare snippet (not a full function), it is automatically wrapped into a demo function body for better context.
 
 Supported model names:
 
 - `lstm`
 - `bilstm`
 - `bilstm_attn`
+- `cnn_bilstm`
+- `bilstm_multihead`
+- `ensemble`
 
 For attention model inference, attention maps are saved to:
 
@@ -107,11 +145,23 @@ Training/evaluation outputs are saved under `results/`:
 - ROC curve: `{model_name}_roc.png`
 - Combined curves: `training_curves.png`
 - Comparison table: `comparison_table.md`
+- Optimal thresholds: `optimal_thresholds.json`
+- Ensemble reports: `ensemble_report.txt`, `ensemble_best2_report.txt`, `ensemble_majority_report.txt`
 
-## Results Table Placeholder
+## Latest Results (Test Set)
 
-| Model | Accuracy | Precision | Recall | F1 | AUC |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| Vanilla LSTM | - | - | - | - | - |
-| Bi-LSTM | - | - | - | - | - |
-| Bi-LSTM + Attention | - | - | - | - | - |
+Values below come from `results/comparison_table.md` after retraining with the corrected tokenizer/vocabulary and threshold tuning.
+
+| Model | Threshold | Accuracy | Precision | Recall | F1 | AUC |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| lstm | 0.78 | 0.8852 | 0.1674 | 0.2516 | 0.2010 | 0.5608 |
+| bilstm | 0.18 | 0.8952 | 0.1981 | 0.2710 | 0.2289 | 0.6606 |
+| bilstm_attn | 0.16 | 0.8645 | 0.1651 | 0.3355 | 0.2213 | 0.7049 |
+| cnn_bilstm | 0.50 | 0.8734 | 0.1742 | 0.3226 | 0.2262 | 0.7076 |
+| bilstm_multihead | 0.24 | 0.7738 | 0.1238 | 0.4839 | 0.1971 | 0.7048 |
+| ensemble | 0.44 | 0.8760 | 0.1875 | 0.3484 | 0.2438 | 0.7291 |
+
+## Report Context
+
+- The vanilla LSTM baseline is intentionally weaker and serves as the comparison anchor.
+- Stronger AUC is achieved by hybrid and attention-heavy models (`cnn_bilstm`, `bilstm_multihead`, and `ensemble`).
