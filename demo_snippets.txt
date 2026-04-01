@@ -1,0 +1,35 @@
+### VULNERABLE_1 | sample_index=44 | ensemble_prob=0.832
+GF_Err odkm_box_write(GF_Box *s, GF_BitStream *bs)
+{
+	return gf_isom_full_box_write(s, bs);
+}
+
+### VULNERABLE_2 | sample_index=61 | ensemble_prob=0.843
+GF_Box *senc_box_new()
+{
+	ISOM_DECL_BOX_ALLOC(GF_SampleEncryptionBox, GF_ISOM_BOX_TYPE_SENC);
+	return (GF_Box *)tmp;
+}
+
+### VULNERABLE_3 | sample_index=92 | ensemble_prob=0.518
+GF_Box *iSFM_box_new()
+{
+	ISOM_DECL_BOX_ALLOC(GF_ISMASampleFormatBox, GF_ISOM_BOX_TYPE_ISFM);
+	return (GF_Box *)tmp;
+}
+
+### SAFE_1 | sample_index=0 | ensemble_prob=0.188
+GF_Box *aprm_box_new()
+{
+	ISOM_DECL_BOX_ALLOC(GF_AdobeStdEncryptionParamsBox, GF_ISOM_BOX_TYPE_APRM);
+	tmp->version = 1;
+	tmp->flags = 0;
+	return (GF_Box *)tmp;
+}
+
+### SAFE_2 | sample_index=1 | ensemble_prob=0.414
+void schi_box_del(GF_Box *s)
+{
+	gf_free(s);
+}
+
