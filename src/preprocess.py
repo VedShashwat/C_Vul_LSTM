@@ -188,8 +188,6 @@ def tokenize_code(code: str) -> List[str]:
 
 
 def normalize_identifiers(tokens: Sequence[str]) -> List[str]:
-    var_map: Dict[str, str] = {}
-    func_map: Dict[str, str] = {}
     normalized: List[str] = []
 
     for i, tok in enumerate(tokens):
@@ -199,14 +197,7 @@ def normalize_identifiers(tokens: Sequence[str]) -> List[str]:
 
         if IDENTIFIER_PATTERN.match(tok):
             is_func_like = (i + 1) < len(tokens) and tokens[i + 1] == "("
-            if is_func_like:
-                if tok not in func_map:
-                    func_map[tok] = f"FUNC_{len(func_map)}"
-                normalized.append(func_map[tok])
-            else:
-                if tok not in var_map:
-                    var_map[tok] = f"VAR_{len(var_map)}"
-                normalized.append(var_map[tok])
+            normalized.append("FUNC_ID" if is_func_like else "VAR_ID")
         else:
             normalized.append(tok)
 
@@ -216,6 +207,7 @@ def normalize_identifiers(tokens: Sequence[str]) -> List[str]:
 def preprocess_tokens(code: str) -> List[str]:
     cleaned = clean_code(code)
     tokens = tokenize_code(cleaned)
+    tokens = normalize_identifiers(tokens)
     return tokens
 
 
@@ -227,6 +219,12 @@ def build_vocab(token_lists: Sequence[Sequence[str]], max_vocab_size: int) -> Di
     vocab = {PAD_TOKEN: 0, UNK_TOKEN: 1}
 
     for token in sorted(PRESERVE_EXACT):
+        if len(vocab) >= max_vocab_size:
+            break
+        if token not in vocab:
+            vocab[token] = len(vocab)
+
+    for token in ["FUNC_ID", "VAR_ID"]:
         if len(vocab) >= max_vocab_size:
             break
         if token not in vocab:

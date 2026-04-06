@@ -16,10 +16,12 @@ from sklearn.metrics import (
     auc,
     classification_report,
     confusion_matrix,
+    fbeta_score,
     f1_score,
     precision_recall_fscore_support,
     roc_curve,
 )
+from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import train_test_split
 from tqdm import tqdm
 
@@ -32,22 +34,116 @@ def _extract_logits(model_output):
     return model_output
 
 
-def _find_best_threshold_from_probs(probs: Sequence[float], labels: Sequence[int]) -> Tuple[float, float]:
-    best_thresh, best_f1 = 0.5, 0.0
-    for thresh in [i / 100 for i in range(10, 90, 2)]:
-        preds = [1 if p >= thresh else 0 for p in probs]
-        f1 = f1_score(labels, preds, zero_division=0)
-        if f1 > best_f1:
-            best_f1 = f1
-            best_thresh = thresh
-    return best_thresh, best_f1
+def _objective_score(
+    labels: Sequence[int],
+    preds: Sequence[int],
+    objective: str,
+    beta: float,
+) -> Tuple[float, float, float, float]:
+    precision, recall, f1, _ = precision_recall_fscore_support(
+        labels,
+        preds,
+        average="binary",
+        zero_division=0,
+    )
+
+    obj = objective.lower()
+    if obj == "f1":
+        score = float(f1)
+    elif obj in {"f2", "fbeta"}:
+        score = float(fbeta_score(labels, preds, beta=beta, zero_division=0))
+    elif obj == "recall":
+        score = float(recall)
+    elif obj == "precision":
+        score = float(precision)
+    elif obj in {"balanced", "balanced_accuracy"}:
+        cm = confusion_matrix(labels, preds, labels=[0, 1])
+        tn, fp, fn, tp = cm.ravel()
+        tpr = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+        tnr = tn / (tn + fp) if (tn + fp) > 0 else 0.0
+        score = float((tpr + tnr) / 2.0)
+    else:
+        score = float(f1)
+
+    return score, float(precision), float(recall), float(f1)
 
 
-def find_optimal_threshold(model, val_loader, device):
+def _find_best_threshold_from_probs(
+    probs: Sequence[float],
+    labels: Sequence[int],
+    objective: str = "f1",
+    beta: float = 2.0,
+    min_recall: Optional[float] = None,
+    threshold_start: float = 0.10,
+    threshold_end: float = 0.90,
+    threshold_step: float = 0.02,
+) -> Tuple[float, float, Dict[str, float]]:
+    best_thresh = 0.5
+    best_score = -1.0
+    best_stats = {"precision": 0.0, "recall": 0.0, "f1": 0.0}
+
+    def sweep(require_recall: Optional[float]) -> Tuple[float, float, Dict[str, float], bool]:
+        local_best_thresh = 0.5
+        local_best_score = -1.0
+        local_best_stats = {"precision": 0.0, "recall": 0.0, "f1": 0.0}
+        found = False
+
+        t = float(threshold_start)
+        while t <= float(threshold_end) + 1e-9:
+            preds = [1 if p >= t else 0 for p in probs]
+            score, precision, recall, f1 = _objective_score(
+                labels=labels,
+                preds=preds,
+                objective=objective,
+                beta=beta,
+            )
+            if require_recall is not None and recall < require_recall:
+                t += threshold_step
+                continue
+
+            if (
+                score > local_best_score
+                or (abs(score - local_best_score) < 1e-12 and recall > local_best_stats["recall"])
+                or (
+                    abs(score - local_best_score) < 1e-12
+                    and abs(recall - local_best_stats["recall"]) < 1e-12
+                    and precision > local_best_stats["precision"]
+                )
+            ):
+                found = True
+                local_best_score = float(score)
+                local_best_thresh = float(t)
+                local_best_stats = {
+                    "precision": float(precision),
+                    "recall": float(recall),
+                    "f1": float(f1),
+                }
+
+            t += threshold_step
+
+        return local_best_thresh, local_best_score, local_best_stats, found
+
+    best_thresh, best_score, best_stats, found_with_constraint = sweep(min_recall)
+    if not found_with_constraint and min_recall is not None:
+        best_thresh, best_score, best_stats, _ = sweep(None)
+
+    return best_thresh, best_score, best_stats
+
+
+def find_optimal_threshold(model, val_loader, device, threshold_policy: Optional[Dict] = None):
     """
-    Sweep thresholds from 0.1 to 0.9 on validation set.
-    Return threshold that maximizes F1 score for class 1 (vulnerable).
+    Sweep thresholds on validation set and optimize a configurable objective.
+    Return threshold that maximizes the configured objective for class 1 (vulnerable).
     """
+
+    policy = threshold_policy or {}
+    objective = str(policy.get("objective", "f1"))
+    beta = float(policy.get("beta", 2.0))
+    min_recall = policy.get("min_recall", None)
+    min_recall = float(min_recall) if min_recall is not None else None
+    threshold_start = float(policy.get("threshold_start", 0.10))
+    threshold_end = float(policy.get("threshold_end", 0.90))
+    threshold_step = float(policy.get("threshold_step", 0.02))
 
     model.eval()
     all_probs: List[float] = []
@@ -61,8 +157,22 @@ def find_optimal_threshold(model, val_loader, device):
             all_probs.extend(probs.tolist())
             all_labels.extend(labels.cpu().numpy().tolist())
 
-    best_thresh, best_f1 = _find_best_threshold_from_probs(all_probs, all_labels)
-    print(f"  Optimal threshold: {best_thresh:.2f} (val F1: {best_f1:.4f})")
+    best_thresh, best_score, best_stats = _find_best_threshold_from_probs(
+        all_probs,
+        all_labels,
+        objective=objective,
+        beta=beta,
+        min_recall=min_recall,
+        threshold_start=threshold_start,
+        threshold_end=threshold_end,
+        threshold_step=threshold_step,
+    )
+    print(
+        "  Optimal threshold: "
+        f"{best_thresh:.2f} (val {objective}: {best_score:.4f}, "
+        f"precision: {best_stats['precision']:.4f}, recall: {best_stats['recall']:.4f}, "
+        f"f1: {best_stats['f1']:.4f})"
+    )
     return best_thresh
 
 
@@ -74,6 +184,7 @@ def evaluate_model(
     device_pref: str = "cpu",
     threshold: Optional[float] = None,
     val_loader=None,
+    threshold_policy: Optional[Dict] = None,
 ) -> Dict[str, float]:
     ensure_dir(results_dir)
     device = resolve_device(device_pref)
@@ -83,7 +194,7 @@ def evaluate_model(
     if threshold is None:
         if val_loader is None:
             raise ValueError("val_loader is required when threshold is None.")
-        threshold = find_optimal_threshold(model, val_loader, device)
+        threshold = find_optimal_threshold(model, val_loader, device, threshold_policy=threshold_policy)
 
     all_labels: List[int] = []
     all_preds: List[int] = []
@@ -259,15 +370,27 @@ def _save_report_and_roc(
     plt.close()
 
 
-def evaluate_ensemble(model_list, model_names, test_loader, val_loader, results_dir, device):
+def evaluate_ensemble(model_list, model_names, test_loader, val_loader, results_dir, device, threshold_policy: Optional[Dict] = None):
     """
-    Soft voting ensemble: average sigmoid probabilities from all models.
-    model_list: list of loaded model objects (already on device, in eval mode)
+    Evaluate multiple ensemble variants and persist the best deployment strategy.
     """
 
     ensure_dir(results_dir)
     if isinstance(device, str):
         device = resolve_device(device)
+
+    policy = threshold_policy or {}
+    objective = str(policy.get("objective", "f1"))
+    beta = float(policy.get("beta", 2.0))
+    min_recall = policy.get("min_recall", None)
+    min_recall = float(min_recall) if min_recall is not None else None
+    threshold_start = float(policy.get("threshold_start", 0.10))
+    threshold_end = float(policy.get("threshold_end", 0.90))
+    threshold_step = float(policy.get("threshold_step", 0.02))
+    ensemble_strategy = str(policy.get("ensemble_strategy", "auto")).lower()
+    forced_quorum = policy.get("ensemble_quorum", None)
+    if forced_quorum is not None:
+        forced_quorum = int(forced_quorum)
 
     labels: List[int] = []
     labels_val: List[int] = []
@@ -308,46 +431,260 @@ def evaluate_ensemble(model_list, model_names, test_loader, val_loader, results_
         probs_by_model[model_name] = np.asarray(model_probs, dtype=np.float32)
         probs_by_model_val[model_name] = np.asarray(model_probs_val, dtype=np.float32)
 
-    stacked_val = np.vstack([probs_by_model_val[name] for name in model_names])
-    ensemble_probs_val = stacked_val.mean(axis=0)
-    ensemble_threshold, ensemble_val_f1 = _find_best_threshold_from_probs(ensemble_probs_val.tolist(), labels_val)
-    print(f"  Ensemble optimal threshold: {ensemble_threshold:.2f} (val F1: {ensemble_val_f1:.4f})")
+    x_val = np.column_stack([probs_by_model_val[name] for name in model_names])
+    x_test = np.column_stack([probs_by_model[name] for name in model_names])
 
-    stacked = np.vstack([probs_by_model[name] for name in model_names])
-    ensemble_probs = stacked.mean(axis=0)
-    ensemble_metrics = _metrics_from_probs(labels, ensemble_probs, threshold=ensemble_threshold)
+    meta_model = LogisticRegression(
+        max_iter=2000,
+        class_weight="balanced",
+        solver="liblinear",
+        random_state=42,
+    )
+    meta_model.fit(x_val, np.asarray(labels_val))
+
+    meta_probs_val = meta_model.predict_proba(x_val)[:, 1]
+    meta_threshold, meta_val_score, meta_val_stats = _find_best_threshold_from_probs(
+        meta_probs_val.tolist(),
+        labels_val,
+        objective=objective,
+        beta=beta,
+        min_recall=min_recall,
+        threshold_start=threshold_start,
+        threshold_end=threshold_end,
+        threshold_step=threshold_step,
+    )
+    meta_probs = meta_model.predict_proba(x_test)[:, 1]
+    meta_metrics = _metrics_from_probs(labels, meta_probs, threshold=meta_threshold)
+
+    avg_probs_val = np.vstack([probs_by_model_val[name] for name in model_names]).mean(axis=0)
+    avg_threshold, avg_val_score, avg_val_stats = _find_best_threshold_from_probs(
+        avg_probs_val.tolist(),
+        labels_val,
+        objective=objective,
+        beta=beta,
+        min_recall=min_recall,
+        threshold_start=threshold_start,
+        threshold_end=threshold_end,
+        threshold_step=threshold_step,
+    )
+    avg_probs = np.vstack([probs_by_model[name] for name in model_names]).mean(axis=0)
+    avg_metrics = _metrics_from_probs(labels, avg_probs, threshold=avg_threshold)
+
+    per_model_thresholds: Dict[str, float] = {}
+    model_f1: Dict[str, float] = {}
+    for name in model_names:
+        t, _, _ = _find_best_threshold_from_probs(
+            probs_by_model_val[name].tolist(),
+            labels_val,
+            objective=objective,
+            beta=beta,
+            min_recall=min_recall,
+            threshold_start=threshold_start,
+            threshold_end=threshold_end,
+            threshold_step=threshold_step,
+        )
+        per_model_thresholds[name] = float(t)
+        model_f1[name] = float(
+            f1_score(labels, (probs_by_model[name] >= t).astype(int), average="binary", zero_division=0)
+        )
+
+    pred_matrix_val = np.vstack(
+        [(probs_by_model_val[name] >= per_model_thresholds[name]).astype(int) for name in model_names]
+    )
+    pred_matrix_test = np.vstack([(probs_by_model[name] >= per_model_thresholds[name]).astype(int) for name in model_names])
+    vote_counts_val = pred_matrix_val.sum(axis=0)
+    vote_counts_test = pred_matrix_test.sum(axis=0)
+
+    def find_best_quorum(require_recall: Optional[float]) -> Tuple[int, float, Dict[str, float], bool]:
+        best_q = max(1, len(model_names) // 2)
+        best_score = -1.0
+        best_stats = {"precision": 0.0, "recall": 0.0, "f1": 0.0}
+        found = False
+
+        for q in range(1, len(model_names) + 1):
+            preds_val = (vote_counts_val >= q).astype(int)
+            score, precision, recall, f1 = _objective_score(
+                labels=labels_val,
+                preds=preds_val,
+                objective=objective,
+                beta=beta,
+            )
+            if require_recall is not None and recall < require_recall:
+                continue
+
+            if (
+                score > best_score
+                or (abs(score - best_score) < 1e-12 and recall > best_stats["recall"])
+                or (
+                    abs(score - best_score) < 1e-12
+                    and abs(recall - best_stats["recall"]) < 1e-12
+                    and precision > best_stats["precision"]
+                )
+            ):
+                found = True
+                best_q = q
+                best_score = float(score)
+                best_stats = {
+                    "precision": float(precision),
+                    "recall": float(recall),
+                    "f1": float(f1),
+                }
+
+        return best_q, best_score, best_stats, found
+
+    if forced_quorum is not None:
+        quorum_q = max(1, min(int(forced_quorum), len(model_names)))
+        forced_preds_val = (vote_counts_val >= quorum_q).astype(int)
+        quorum_val_score, quorum_precision_val, quorum_recall_val, quorum_f1_val = _objective_score(
+            labels=labels_val,
+            preds=forced_preds_val,
+            objective=objective,
+            beta=beta,
+        )
+        quorum_val_stats = {
+            "precision": float(quorum_precision_val),
+            "recall": float(quorum_recall_val),
+            "f1": float(quorum_f1_val),
+        }
+    else:
+        quorum_q, quorum_val_score, quorum_val_stats, quorum_found = find_best_quorum(min_recall)
+        if not quorum_found and min_recall is not None:
+            quorum_q, quorum_val_score, quorum_val_stats, _ = find_best_quorum(None)
+
+    quorum_preds = (vote_counts_test >= quorum_q).astype(int)
+    quorum_scores = vote_counts_test.astype(np.float32) / float(len(model_names))
+    quorum_fpr, quorum_tpr, _ = roc_curve(labels, quorum_scores)
+    quorum_auc = auc(quorum_fpr, quorum_tpr)
+    quorum_accuracy = accuracy_score(labels, quorum_preds)
+    quorum_precision, quorum_recall, quorum_f1, _ = precision_recall_fscore_support(
+        labels,
+        quorum_preds,
+        average="binary",
+        zero_division=0,
+    )
+    quorum_metrics = {
+        "accuracy": float(quorum_accuracy),
+        "precision": float(quorum_precision),
+        "recall": float(quorum_recall),
+        "f1": float(quorum_f1),
+        "auc": float(quorum_auc),
+        "threshold": float(quorum_q / len(model_names)),
+        "fpr": quorum_fpr,
+        "tpr": quorum_tpr,
+        "preds": quorum_preds,
+    }
+
+    candidate_data = {
+        "meta": {
+            "name": "logistic_meta",
+            "val_score": float(meta_val_score),
+            "val_stats": meta_val_stats,
+            "metrics": meta_metrics,
+            "probs": meta_probs,
+            "title": "Ensemble ROC Curve (Meta-Calibrated)",
+            "threshold": float(meta_threshold),
+        },
+        "avg": {
+            "name": "avg",
+            "val_score": float(avg_val_score),
+            "val_stats": avg_val_stats,
+            "metrics": avg_metrics,
+            "probs": avg_probs,
+            "title": "Ensemble ROC Curve (Average Soft Voting)",
+            "threshold": float(avg_threshold),
+        },
+        "quorum": {
+            "name": "quorum_vote",
+            "val_score": float(quorum_val_score),
+            "val_stats": quorum_val_stats,
+            "metrics": quorum_metrics,
+            "probs": quorum_scores,
+            "title": f"Ensemble ROC Curve (Quorum Vote q={quorum_q})",
+            "threshold": float(quorum_q / len(model_names)),
+        },
+    }
+
+    if ensemble_strategy in {"meta", "avg", "quorum"}:
+        selected_key = ensemble_strategy
+    else:
+        selected_key = max(
+            candidate_data.keys(),
+            key=lambda k: (
+                candidate_data[k]["val_score"],
+                candidate_data[k]["val_stats"]["recall"],
+                candidate_data[k]["val_stats"]["precision"],
+            ),
+        )
+
+    selected = candidate_data[selected_key]
+    ensemble_metrics = selected["metrics"]
+
+    print(
+        f"  Selected ensemble strategy: {selected['name']} "
+        f"(val {objective}: {selected['val_score']:.4f}, recall: {selected['val_stats']['recall']:.4f})"
+    )
+    if selected_key == "quorum" and forced_quorum is not None:
+        print(f"  Quorum was explicitly set to q={quorum_q} via config.")
 
     _save_report_and_roc(
         labels=labels,
         preds=ensemble_metrics["preds"],
-        probs=ensemble_probs,
+        probs=selected["probs"],
         fpr=ensemble_metrics["fpr"],
         tpr=ensemble_metrics["tpr"],
         roc_auc=ensemble_metrics["auc"],
         report_path=Path(results_dir) / "ensemble_report.txt",
         roc_path=Path(results_dir) / "ensemble_roc.png",
-        title="Ensemble ROC Curve",
-        threshold=ensemble_threshold,
+        title=selected["title"],
+        threshold=selected["threshold"],
     )
 
-    per_model_thresholds = {}
-    model_f1 = {
-        name: (
-            lambda t: f1_score(labels, (probs_by_model[name] >= t).astype(int), average="binary", zero_division=0)
-        )(
-            _find_best_threshold_from_probs(probs_by_model_val[name].tolist(), labels_val)[0]
-        )
-        for name in model_names
-    }
-    for name in model_names:
-        t, _ = _find_best_threshold_from_probs(probs_by_model_val[name].tolist(), labels_val)
-        per_model_thresholds[name] = t
+    if selected_key == "meta":
+        ensemble_meta = {
+            "method": "logistic_meta",
+            "model_names": model_names,
+            "coefficients": [float(x) for x in meta_model.coef_[0].tolist()],
+            "intercept": float(meta_model.intercept_[0]),
+            "threshold": float(meta_threshold),
+            "objective": objective,
+            "beta": float(beta),
+        }
+    elif selected_key == "avg":
+        ensemble_meta = {
+            "method": "avg",
+            "model_names": model_names,
+            "threshold": float(avg_threshold),
+            "objective": objective,
+            "beta": float(beta),
+        }
+    else:
+        ensemble_meta = {
+            "method": "quorum_vote",
+            "model_names": model_names,
+            "per_model_thresholds": {k: float(v) for k, v in per_model_thresholds.items()},
+            "quorum": int(quorum_q),
+            "threshold": float(quorum_q / len(model_names)),
+            "objective": objective,
+            "beta": float(beta),
+        }
+
+    with open(Path(results_dir) / "ensemble_meta.json", "w", encoding="utf-8") as f:
+        json.dump(ensemble_meta, f, ensure_ascii=True, indent=2)
 
     top2 = sorted(model_f1.items(), key=lambda x: x[1], reverse=True)[:2]
     top2_names = [x[0] for x in top2]
 
     top2_probs_val = np.vstack([probs_by_model_val[name] for name in top2_names]).mean(axis=0)
-    top2_threshold, _ = _find_best_threshold_from_probs(top2_probs_val.tolist(), labels_val)
+    top2_threshold, _, _ = _find_best_threshold_from_probs(
+        top2_probs_val.tolist(),
+        labels_val,
+        objective=objective,
+        beta=beta,
+        min_recall=min_recall,
+        threshold_start=threshold_start,
+        threshold_end=threshold_end,
+        threshold_step=threshold_step,
+    )
 
     top2_probs = np.vstack([probs_by_model[name] for name in top2_names]).mean(axis=0)
     top2_metrics = _metrics_from_probs(labels, top2_probs, threshold=top2_threshold)
@@ -365,12 +702,7 @@ def evaluate_ensemble(model_list, model_names, test_loader, val_loader, results_
         threshold=top2_threshold,
     )
 
-    pred_matrix = []
-    for name in model_names:
-        pred_matrix.append((probs_by_model[name] >= per_model_thresholds[name]).astype(int))
-    pred_matrix = np.vstack(pred_matrix)
-    majority_preds = (pred_matrix.sum(axis=0) >= 2).astype(int)
-
+    majority_preds = (pred_matrix_test.sum(axis=0) >= 2).astype(int)
     majority_report = str(classification_report(labels, majority_preds, digits=4, zero_division=0))
     majority_accuracy = accuracy_score(labels, majority_preds)
     majority_precision, majority_recall, majority_f1, _ = precision_recall_fscore_support(
@@ -396,7 +728,8 @@ def evaluate_ensemble(model_list, model_names, test_loader, val_loader, results_
             "recall": ensemble_metrics["recall"],
             "f1": ensemble_metrics["f1"],
             "auc": ensemble_metrics["auc"],
-            "threshold": ensemble_metrics["threshold"],
+            "threshold": selected["threshold"],
+            "strategy": selected["name"],
         },
         "best2": {
             "accuracy": top2_metrics["accuracy"],

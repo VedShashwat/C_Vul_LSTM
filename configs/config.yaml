@@ -26,9 +26,19 @@ training:
   seed: 42
   device: cuda
   use_focal_loss: true
-  focal_alpha: 0.75
-  focal_gamma: 3.0
+  focal_alpha: 0.5
+  focal_gamma: 2.0
   use_warmup_cosine: true
-  oversample_factor: 5.0
+  oversample_factor: 2.5
+
+evaluation:
+  threshold_objective: f2
+  threshold_beta: 2.0
+  threshold_min_recall: 0.35
+  threshold_start: 0.05
+  threshold_end: 0.90
+  threshold_step: 0.01
+  ensemble_strategy: quorum
+  ensemble_quorum: 3
 
 results_dir: results/

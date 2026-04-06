@@ -1,5 +1,6 @@
 import argparse
 import json
+import math
 from pathlib import Path
 from typing import Dict, List
 
@@ -60,6 +61,15 @@ def _load_thresholds(results_dir: Path) -> Dict[str, float]:
     return {k: float(v) for k, v in data.items()}
 
 
+def _load_ensemble_meta(results_dir: Path) -> Dict:
+    path = results_dir / "ensemble_meta.json"
+    if not path.exists():
+        return {}
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    return data if isinstance(data, dict) else {}
+
+
 def _build_model_from_config(model_name: str, config: Dict, vocab: Dict[str, int]):
     return build_model(
         model_name=model_name,
@@ -83,6 +93,10 @@ def _predict_single_model(model, seq: torch.Tensor) -> float:
         return float(torch.sigmoid(logits).item())
 
 
+def _sigmoid_scalar(x: float) -> float:
+    return 1.0 / (1.0 + math.exp(-x))
+
+
 def main() -> None:
     args = parse_args()
     config = load_config(args.config)
@@ -93,6 +107,7 @@ def main() -> None:
     results_dir = Path(config["results_dir"])
     ensure_dir(str(results_dir))
     thresholds = _load_thresholds(results_dir)
+    ensemble_meta = _load_ensemble_meta(results_dir)
 
     vocab = _load_vocab(processed_dir / "vocab.json")
 
@@ -102,7 +117,7 @@ def main() -> None:
 
     if args.model == "ensemble":
         ensemble_models = ["lstm", "bilstm", "bilstm_attn", "cnn_bilstm", "bilstm_multihead"]
-        probs: List[float] = []
+        probs_by_name: Dict[str, float] = {}
         for model_name in ensemble_models:
             model = _build_model_from_config(model_name, config, vocab)
             checkpoint_path = results_dir / f"{model_name}_best.pt"
@@ -111,10 +126,49 @@ def main() -> None:
             load_checkpoint(model=model, checkpoint_path=str(checkpoint_path), map_location=device)
             model = model.to(device)
             model.eval()
-            probs.append(_predict_single_model(model, seq))
+            probs_by_name[model_name] = _predict_single_model(model, seq)
 
-        prob_vuln = float(sum(probs) / len(probs))
-        decision_threshold = thresholds.get("ensemble", 0.5)
+        method = str(ensemble_meta.get("method", "avg"))
+
+        if method == "logistic_meta":
+            ordered_names = ensemble_meta.get("model_names", ensemble_models)
+            coeffs = ensemble_meta.get("coefficients", [])
+            intercept = float(ensemble_meta.get("intercept", 0.0))
+
+            if len(ordered_names) == len(coeffs) and all(name in probs_by_name for name in ordered_names):
+                score = intercept
+                for name, coeff in zip(ordered_names, coeffs):
+                    score += float(coeff) * float(probs_by_name[name])
+                prob_vuln = float(_sigmoid_scalar(score))
+                decision_threshold = float(ensemble_meta.get("threshold", thresholds.get("ensemble", 0.5)))
+                ensemble_method = "meta"
+            else:
+                prob_vuln = float(sum(probs_by_name.values()) / len(probs_by_name))
+                decision_threshold = thresholds.get("ensemble", 0.5)
+                ensemble_method = "avg-fallback"
+        elif method == "avg":
+            prob_vuln = float(sum(probs_by_name.values()) / len(probs_by_name))
+            decision_threshold = float(ensemble_meta.get("threshold", thresholds.get("ensemble", 0.5)))
+            ensemble_method = "avg"
+        elif method == "quorum_vote":
+            ordered_names = ensemble_meta.get("model_names", ensemble_models)
+            per_model_thresholds = ensemble_meta.get("per_model_thresholds", {})
+            quorum = int(ensemble_meta.get("quorum", max(1, len(ordered_names) // 2)))
+
+            votes = 0
+            for name in ordered_names:
+                prob = float(probs_by_name.get(name, 0.0))
+                model_threshold = float(per_model_thresholds.get(name, thresholds.get(name, 0.5)))
+                if prob >= model_threshold:
+                    votes += 1
+
+            prob_vuln = float(votes / max(1, len(ordered_names)))
+            decision_threshold = float(quorum / max(1, len(ordered_names)))
+            ensemble_method = f"quorum-vote(q={quorum})"
+        else:
+            prob_vuln = float(sum(probs_by_name.values()) / len(probs_by_name))
+            decision_threshold = thresholds.get("ensemble", 0.5)
+            ensemble_method = "avg"
     else:
         model = _build_model_from_config(args.model, config, vocab)
         checkpoint_path = results_dir / f"{args.model}_best.pt"
@@ -132,6 +186,9 @@ def main() -> None:
         print(f"Prediction: VULNERABLE (confidence: {prob_vuln * 100:.1f}%, threshold: {decision_threshold:.2f})")
     else:
         print(f"Prediction: SAFE (confidence: {(1 - prob_vuln) * 100:.1f}%, threshold: {decision_threshold:.2f})")
+
+    if args.model == "ensemble":
+        print(f"Ensemble method: {ensemble_method}")
 
     if args.model == "bilstm_attn":
         vocab_inv = {idx: tok for tok, idx in vocab.items()}

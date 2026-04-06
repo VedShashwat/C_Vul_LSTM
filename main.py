@@ -89,6 +89,20 @@ def _ensure_checkpoints(results_dir: Path, model_names: List[str]) -> None:
         raise FileNotFoundError(f"Missing checkpoints: {missing}")
 
 
+def _get_threshold_policy(config: Dict) -> Dict:
+    evaluation_cfg = config.get("evaluation", {}) or {}
+    return {
+        "objective": str(evaluation_cfg.get("threshold_objective", "f1")),
+        "beta": float(evaluation_cfg.get("threshold_beta", 2.0)),
+        "min_recall": evaluation_cfg.get("threshold_min_recall", None),
+        "threshold_start": float(evaluation_cfg.get("threshold_start", 0.10)),
+        "threshold_end": float(evaluation_cfg.get("threshold_end", 0.90)),
+        "threshold_step": float(evaluation_cfg.get("threshold_step", 0.02)),
+        "ensemble_strategy": str(evaluation_cfg.get("ensemble_strategy", "auto")),
+        "ensemble_quorum": evaluation_cfg.get("ensemble_quorum", None),
+    }
+
+
 def run_pipeline(
     config_path: str,
     skip_preprocess: bool,
@@ -98,6 +112,7 @@ def run_pipeline(
 ) -> str:
     config = load_config(config_path)
     seed_everything(int(config["training"]["seed"]))
+    threshold_policy = _get_threshold_policy(config)
 
     processed_dir = Path(config["data"]["processed_dir"])
     results_dir = Path(config["results_dir"])
@@ -144,6 +159,7 @@ def run_pipeline(
                 device_pref=config["training"].get("device", "cpu"),
                 threshold=None,
                 val_loader=val_loader,
+                threshold_policy=threshold_policy,
             )
             eval_results[model_name] = metrics
             loaded_models[model_name] = model
@@ -166,6 +182,7 @@ def run_pipeline(
                 device_pref=config["training"].get("device", "cpu"),
                 threshold=None,
                 val_loader=val_loader,
+                threshold_policy=threshold_policy,
             )
             eval_results[model_name] = metrics
             loaded_models[model_name] = model
@@ -194,6 +211,7 @@ def run_pipeline(
                 device_pref=config["training"].get("device", "cpu"),
                 threshold=None,
                 val_loader=val_loader,
+                threshold_policy=threshold_policy,
             )
             eval_results[model_name] = metrics
             loaded_models[model_name] = model
@@ -238,6 +256,7 @@ def run_pipeline(
                     device_pref=config["training"].get("device", "cpu"),
                     threshold=None,
                     val_loader=val_loader,
+                    threshold_policy=threshold_policy,
                 )
                 eval_results[model_name] = metrics
                 loaded_models[model_name] = model
@@ -260,6 +279,7 @@ def run_pipeline(
         val_loader=val_loader,
         results_dir=config["results_dir"],
         device=config["training"].get("device", "cpu"),
+        threshold_policy=threshold_policy,
     )
 
     eval_results["ensemble"] = ensemble_results["ensemble"]
