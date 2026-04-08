@@ -8,7 +8,7 @@ import torch
 
 from src.attention_viz import visualize_attention
 from src.models import build_model
-from src.preprocess import preprocess_single
+from src.preprocess import extract_vulnerability_features, preprocess_single
 from src.utils import ensure_dir, load_checkpoint, load_config, resolve_device
 
 
@@ -83,12 +83,19 @@ def _build_model_from_config(model_name: str, config: Dict, vocab: Dict[str, int
         cnn_num_filters=int(config["model"].get("cnn_num_filters", 128)),
         cnn_kernel_sizes=config["model"].get("cnn_kernel_sizes", [3, 5, 7]),
         num_attention_heads=int(config["model"].get("num_attention_heads", 4)),
+        vuln_feature_dim=int(config["data"].get("vuln_feature_dim", 32)),
     )
 
 
-def _predict_single_model(model, seq: torch.Tensor) -> float:
+def _predict_single_model(model, seq: torch.Tensor, vuln_features: torch.Tensor | None = None) -> float:
     with torch.no_grad():
-        output = model(seq)
+        if vuln_features is not None:
+            try:
+                output = model(seq, vuln_features=vuln_features)
+            except TypeError:
+                output = model(seq)
+        else:
+            output = model(seq)
         logits = output[0] if isinstance(output, tuple) else output
         return float(torch.sigmoid(logits).item())
 
@@ -114,6 +121,8 @@ def main() -> None:
     device = resolve_device(config["training"].get("device", "cpu"))
 
     seq = preprocess_single(code_str, vocab, max_seq_len=int(config["data"]["max_seq_len"])).to(device)
+    vuln_feats = extract_vulnerability_features(code_str)
+    vuln_feat_tensor = torch.tensor(vuln_feats, dtype=torch.float32).unsqueeze(0).to(device)
 
     if args.model == "ensemble":
         ensemble_models = ["lstm", "bilstm", "bilstm_attn", "cnn_bilstm", "bilstm_multihead"]
@@ -126,7 +135,7 @@ def main() -> None:
             load_checkpoint(model=model, checkpoint_path=str(checkpoint_path), map_location=device)
             model = model.to(device)
             model.eval()
-            probs_by_name[model_name] = _predict_single_model(model, seq)
+            probs_by_name[model_name] = _predict_single_model(model, seq, vuln_features=vuln_feat_tensor)
 
         method = str(ensemble_meta.get("method", "avg"))
 
@@ -179,7 +188,7 @@ def main() -> None:
         model = model.to(device)
         model.eval()
 
-        prob_vuln = _predict_single_model(model, seq)
+        prob_vuln = _predict_single_model(model, seq, vuln_features=vuln_feat_tensor)
         decision_threshold = thresholds.get(args.model, 0.5)
 
     if prob_vuln >= decision_threshold:

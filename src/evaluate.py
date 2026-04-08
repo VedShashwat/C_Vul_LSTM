@@ -34,6 +34,24 @@ def _extract_logits(model_output):
     return model_output
 
 
+def _split_batch(batch, device):
+    sequences = batch[0].to(device, non_blocking=True)
+    labels = batch[1].to(device, non_blocking=True)
+    vuln_features = None
+    if len(batch) > 2:
+        vuln_features = batch[2].float().to(device, non_blocking=True)
+    return sequences, labels, vuln_features
+
+
+def _forward_with_optional_features(model, sequences: torch.Tensor, vuln_features: Optional[torch.Tensor]):
+    if vuln_features is not None:
+        try:
+            return model(sequences, vuln_features=vuln_features)
+        except TypeError:
+            return model(sequences)
+    return model(sequences)
+
+
 def _objective_score(
     labels: Sequence[int],
     preds: Sequence[int],
@@ -150,8 +168,8 @@ def find_optimal_threshold(model, val_loader, device, threshold_policy: Optional
     all_labels: List[int] = []
     with torch.no_grad():
         for batch in val_loader:
-            seqs, labels = batch[0].to(device), batch[1].to(device)
-            out = model(seqs)
+            seqs, labels, vuln_features = _split_batch(batch, device)
+            out = _forward_with_optional_features(model, seqs, vuln_features)
             logit = out[0] if isinstance(out, tuple) else out
             probs = torch.sigmoid(logit).cpu().numpy()
             all_probs.extend(probs.tolist())
@@ -201,11 +219,10 @@ def evaluate_model(
     all_probs: List[float] = []
 
     with torch.no_grad():
-        for sequences, labels in tqdm(test_loader, desc=f"Evaluating {model_name}", leave=False):
-            sequences = sequences.to(device, non_blocking=True)
-            labels = labels.to(device, non_blocking=True)
+        for batch in tqdm(test_loader, desc=f"Evaluating {model_name}", leave=False):
+            sequences, labels, vuln_features = _split_batch(batch, device)
 
-            logits = _extract_logits(model(sequences))
+            logits = _extract_logits(_forward_with_optional_features(model, sequences, vuln_features))
             probs = torch.sigmoid(logits)
             preds = (probs >= threshold).long()
 
@@ -406,18 +423,18 @@ def evaluate_ensemble(model_list, model_names, test_loader, val_loader, results_
         current_labels_val: List[int] = []
 
         with torch.no_grad():
-            for sequences, y in tqdm(val_loader, desc=f"Ensemble val pass: {model_name}", leave=False):
-                sequences = sequences.to(device, non_blocking=True)
-                logits = _extract_logits(model(sequences))
+            for batch in tqdm(val_loader, desc=f"Ensemble val pass: {model_name}", leave=False):
+                sequences, y, vuln_features = _split_batch(batch, device)
+                logits = _extract_logits(_forward_with_optional_features(model, sequences, vuln_features))
                 probs = torch.sigmoid(logits)
 
                 model_probs_val.extend(probs.cpu().numpy().tolist())
                 current_labels_val.extend(y.cpu().numpy().tolist())
 
         with torch.no_grad():
-            for sequences, y in tqdm(test_loader, desc=f"Ensemble pass: {model_name}", leave=False):
-                sequences = sequences.to(device, non_blocking=True)
-                logits = _extract_logits(model(sequences))
+            for batch in tqdm(test_loader, desc=f"Ensemble pass: {model_name}", leave=False):
+                sequences, y, vuln_features = _split_batch(batch, device)
+                logits = _extract_logits(_forward_with_optional_features(model, sequences, vuln_features))
                 probs = torch.sigmoid(logits)
 
                 model_probs.extend(probs.cpu().numpy().tolist())
@@ -854,9 +871,9 @@ def per_cwe_analysis(best_model, test_loader, test_cwe_labels, results_dir):
     labels: List[int] = []
     preds: List[int] = []
     with torch.no_grad():
-        for sequences, y in tqdm(test_loader, desc="Per-CWE inference", leave=False):
-            sequences = sequences.to(device, non_blocking=True)
-            logits = _extract_logits(best_model(sequences))
+        for batch in tqdm(test_loader, desc="Per-CWE inference", leave=False):
+            sequences, y, vuln_features = _split_batch(batch, device)
+            logits = _extract_logits(_forward_with_optional_features(best_model, sequences, vuln_features))
             p = torch.sigmoid(logits)
             pred = (p >= 0.5).long()
             labels.extend(y.cpu().numpy().tolist())

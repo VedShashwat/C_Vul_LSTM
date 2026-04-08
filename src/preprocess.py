@@ -152,6 +152,227 @@ WHITESPACE_PATTERN = re.compile(r"\s+")
 IDENTIFIER_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
+# Synthetic structural vulnerability examples for optional train-only augmentation.
+SYNTHETIC_VULNERABLE: List[Tuple[str, int]] = [
+    (
+        """void process(unsigned int len, char *src) {
+    int size = len + 1;
+    char *buf = malloc(size);
+    memcpy(buf, src, len);
+}""",
+        1,
+    ),
+    (
+        """void copy_data(char *dst, char *src, int n) {
+    int i;
+    for (i = 0; i <= n; i++) {
+        dst[i] = src[i];
+    }
+}""",
+        1,
+    ),
+    (
+        """void init_buffer(int size) {
+    char *buf = malloc(size);
+    buf[0] = 0;
+    buf[size-1] = 0;
+}""",
+        1,
+    ),
+    (
+        """void index_data(int idx, char *arr) {
+    if (idx < MAX_SIZE) {
+        char val = arr[idx];
+        process(val);
+    }
+}""",
+        1,
+    ),
+    (
+        """void cleanup(char *p, int err) {
+    if (err) {
+        free(p);
+    }
+    free(p);
+}""",
+        1,
+    ),
+    (
+        """void handle(struct obj *p) {
+    free(p);
+    if (p->active) {
+        p->run();
+    }
+}""",
+        1,
+    ),
+    (
+        """void log_input(char *user_input) {
+    printf(user_input);
+}""",
+        1,
+    ),
+    (
+        """void read_data(int fd, char *buf, int len) {
+    read(fd, buf, len);
+    process(buf);
+}""",
+        1,
+    ),
+    (
+        """int recurse(int n) {
+    return recurse(n - 1) + n;
+}""",
+        1,
+    ),
+    (
+        """void shift(char *buf, int offset, int len) {
+    char *ptr = buf + offset;
+    memmove(ptr, buf, len);
+}""",
+        1,
+    ),
+    (
+        """void process_items(int count, item_t *items) {
+    int i;
+    for (i = 0; i < count; i++) {
+        if (items[i].type == ADMIN) items[i].level = get_level(i);
+    }
+}""",
+        1,
+    ),
+    (
+        """size_t get_size(short input) {
+    return (size_t)input * sizeof(int);
+}""",
+        1,
+    ),
+    (
+        """void write_val(char *dst, int len, int val) {
+    if (len - 1 >= 0) {
+        dst[len] = val;
+    }
+}""",
+        1,
+    ),
+    (
+        """int check_bounds(int val) {
+    unsigned int uval = val;
+    if (uval < MAX) {
+        return arr[uval];
+    }
+    return -1;
+}""",
+        1,
+    ),
+    (
+        """void update(struct state *s) {
+    s->count++;
+    if (s->count > LIMIT) {
+        free(s->buf);
+    }
+    use(s->buf);
+}""",
+        1,
+    ),
+]
+
+
+SYNTHETIC_SAFE: List[Tuple[str, int]] = [
+    (
+        """int clamp(int val, int lo, int hi) {
+    if (val < lo) return lo;
+    if (val > hi) return hi;
+    return val;
+}""",
+        0,
+    ),
+    (
+        """int safe_add(int a, int b, int *result) {
+    if (b > 0 && a > INT_MAX - b) return -1;
+    if (b < 0 && a < INT_MIN - b) return -1;
+    *result = a + b;
+    return 0;
+}""",
+        0,
+    ),
+    (
+        """char *safe_copy(const char *src, size_t max_len) {
+    size_t len = strnlen(src, max_len);
+    char *dst = malloc(len + 1);
+    if (!dst) return NULL;
+    memcpy(dst, src, len);
+    dst[len] = 0;
+    return dst;
+}""",
+        0,
+    ),
+    (
+        """int read_safe(int fd, char *buf, size_t len) {
+    ssize_t n = read(fd, buf, len - 1);
+    if (n < 0) return -1;
+    buf[n] = 0;
+    return (int)n;
+}""",
+        0,
+    ),
+    (
+        """void init(struct obj *p, int val) {
+    if (!p) return;
+    p->value = val;
+    p->ready = 1;
+}""",
+        0,
+    ),
+    (
+        """int binary_search(int *arr, int n, int target) {
+    int lo = 0, hi = n - 1;
+    while (lo <= hi) {
+        int mid = lo + (hi - lo) / 2;
+        if (arr[mid] == target) return mid;
+        if (arr[mid] < target) lo = mid + 1;
+        else hi = mid - 1;
+    }
+    return -1;
+}""",
+        0,
+    ),
+    (
+        """size_t safe_strlen(const char *s, size_t max) {
+    size_t i = 0;
+    while (i < max && s[i]) i++;
+    return i;
+}""",
+        0,
+    ),
+    (
+        """void swap(int *a, int *b) {
+    int tmp = *a;
+    *a = *b;
+    *b = tmp;
+}""",
+        0,
+    ),
+    (
+        """int max3(int a, int b, int c) {
+    int m = (a > b) ? a : b;
+    return (m > c) ? m : c;
+}""",
+        0,
+    ),
+    (
+        """struct node *alloc_node(int val) {
+    struct node *n = calloc(1, sizeof(*n));
+    if (!n) return NULL;
+    n->val = val;
+    n->next = NULL;
+    return n;
+}""",
+        0,
+    ),
+]
+
+
 def clean_code(code: str) -> str:
     code = COMMENT_PATTERN.sub(" ", code)
     code = STRING_PATTERN.sub(f" {STRING_TOKEN} ", code)
@@ -211,6 +432,117 @@ def preprocess_tokens(code: str) -> List[str]:
     return tokens
 
 
+def extract_vulnerability_features(code: str) -> List[float]:
+    """
+    32 features covering both obvious and structural vulnerability patterns.
+    """
+
+    f: List[float] = []
+
+    # Group A: dangerous function presence (8).
+    for fn in ["gets", "strcpy", "sprintf", "scanf", "memcpy", "alloca", "system", "execve"]:
+        f.append(1.0 if re.search(r"\b" + fn + r"\s*\(", code) else 0.0)
+
+    # Group B: structural memory issues (8).
+    f.append(1.0 if re.search(r"for\s*\([^)]*;\s*\w+\s*<=\s*\w+", code) else 0.0)
+
+    n_malloc = len(re.findall(r"\b(malloc|calloc|realloc)\s*\(", code))
+    n_null_checks = len(re.findall(r"==\s*NULL|!=\s*NULL|if\s*\(\s*!", code))
+    f.append(min(max(n_malloc - n_null_checks, 0) / 3.0, 1.0))
+
+    frees = re.findall(r"\bfree\s*\(\s*(\w+)\s*\)", code)
+    f.append(1.0 if len(frees) != len(set(frees)) and len(frees) > 1 else 0.0)
+
+    uaf_hit = 0.0
+    for var in set(frees):
+        if re.search(r"free\s*\(\s*" + re.escape(var) + r"\s*\).*" + re.escape(var) + r"\s*[.\->\[]", code, re.DOTALL):
+            uaf_hit = 1.0
+            break
+    f.append(uaf_hit)
+
+    f.append(1.0 if re.search(r"\w+\s*\+\s*\w+\s*[\[\)]", code) else 0.0)
+    f.append(1.0 if re.search(r"malloc\s*\(\s*\w+\s*[+\-*]\s*\w+", code) else 0.0)
+    f.append(1.0 if re.search(r"return\s*&\s*\w+", code) else 0.0)
+
+    io_calls = len(re.findall(r"\b(read|write|recv|send|fread|fwrite)\s*\(", code))
+    checked_io = len(re.findall(r"(if|while)\s*\([^)]*\b(read|write|recv|send|fread|fwrite)\b", code))
+    f.append(1.0 if io_calls > 0 and checked_io == 0 else 0.0)
+
+    # Group C: integer/arithmetic vulnerabilities (6).
+    f.append(1.0 if re.search(r"\b(unsigned|size_t|uint)\b[^;]*[<>]=?\s*\b\w+", code) else 0.0)
+    f.append(1.0 if re.search(r"(malloc|calloc)\s*\(\s*\w+\s*\*", code) else 0.0)
+    f.append(1.0 if re.search(r"\(size_t\)\s*-|\(unsigned\s+int\)\s*-", code) else 0.0)
+    f.append(1.0 if re.search(r"malloc\s*\([^)]*-[^)]*\)", code) else 0.0)
+    f.append(1.0 if re.search(r"\bshort\b.*malloc|malloc.*\bshort\b", code) else 0.0)
+    f.append(1.0 if re.search(r"for\s*\([^)]*;\s*\w+\s*<\s*(len|size|count|n|num)\b", code) else 0.0)
+
+    # Group D: format string / injection (3).
+    f.append(1.0 if re.search(r"\b(printf|fprintf|syslog)\s*\(\s*[^\"'%\n]", code) else 0.0)
+    f.append(1.0 if re.search(r"\bsprintf\s*\(\s*\w+\s*,", code) else 0.0)
+    f.append(1.0 if re.search(r"\bstrcat\s*\(", code) else 0.0)
+
+    # Group E: complexity proxies (4).
+    f.append(min(len(code) / 2000.0, 1.0))
+
+    depth = 0
+    max_depth = 0
+    for ch in code:
+        if ch == "{":
+            depth += 1
+            max_depth = max(max_depth, depth)
+        elif ch == "}":
+            depth = max(depth - 1, 0)
+    f.append(min(max_depth / 5.0, 1.0))
+
+    deref_count = len(re.findall(r"\*\w+|\w+\s*->", code))
+    f.append(min(deref_count / 20.0, 1.0))
+
+    cast_count = len(re.findall(r"\(\s*(int|char|void\s*\*|unsigned|size_t|long)\s*\)", code))
+    f.append(min(cast_count / 10.0, 1.0))
+
+    # Group F: control flow (3).
+    has_array_access = bool(re.search(r"\w+\[\w+\]", code))
+    has_bounds_check = bool(re.search(r"if\s*\([^)]*<\s*(sizeof|MAX|SIZE|LEN|LIMIT|max|size)", code))
+    f.append(1.0 if has_array_access and not has_bounds_check else 0.0)
+
+    f.append(1.0 if re.search(r"\bgoto\b", code) else 0.0)
+
+    fn_decl = re.search(r"\b([A-Za-z_]\w*)\s*\([^;{}]*\)\s*\{", code)
+    if fn_decl:
+        fn_name = fn_decl.group(1)
+        body = code[fn_decl.end() :]
+        is_recursive = bool(re.search(r"\b" + re.escape(fn_name) + r"\s*\(", body))
+        has_base_case = bool(re.search(r"if\s*\([^)]*\)\s*(\{\s*return|return)", body[:300]))
+        f.append(1.0 if is_recursive and not has_base_case else 0.0)
+    else:
+        f.append(0.0)
+
+    assert len(f) == 32, f"Feature count mismatch: {len(f)}"
+    return f
+
+
+def augment_train_with_synthetic(
+    train_funcs: List[str],
+    train_labels: List[int],
+    vuln_repeat: int,
+    safe_repeat: int,
+) -> Tuple[List[str], List[int]]:
+    augmented_funcs = list(train_funcs)
+    augmented_labels = list(train_labels)
+
+    for code, label in SYNTHETIC_VULNERABLE:
+        for _ in range(max(0, vuln_repeat)):
+            augmented_funcs.append(code)
+            augmented_labels.append(label)
+
+    for code, label in SYNTHETIC_SAFE:
+        for _ in range(max(0, safe_repeat)):
+            augmented_funcs.append(code)
+            augmented_labels.append(label)
+
+    return augmented_funcs, augmented_labels
+
+
 def build_vocab(token_lists: Sequence[Sequence[str]], max_vocab_size: int) -> Dict[str, int]:
     counter: Counter = Counter()
     for tokens in token_lists:
@@ -243,6 +575,7 @@ def build_vocab(token_lists: Sequence[Sequence[str]], max_vocab_size: int) -> Di
 def encode_and_pad(
     token_lists: Sequence[Sequence[str]],
     labels: Sequence[int],
+    feature_lists: Sequence[Sequence[float]],
     vocab: Dict[str, int],
     max_seq_len: int,
 ) -> Dict[str, torch.Tensor]:
@@ -254,7 +587,8 @@ def encode_and_pad(
             sequences[i, : len(token_ids)] = torch.tensor(token_ids, dtype=torch.long)
 
     label_tensor = torch.tensor(labels, dtype=torch.long)
-    return {"sequences": sequences, "labels": label_tensor}
+    feature_tensor = torch.tensor(feature_lists, dtype=torch.float32)
+    return {"sequences": sequences, "labels": label_tensor, "vuln_features": feature_tensor}
 
 
 def _to_list(dataset, key: str) -> List:
@@ -356,18 +690,40 @@ def preprocess_and_save(config_path: str = "configs/config.yaml") -> None:
     train_ratio = float(config["data"]["train_ratio"])
     val_ratio = float(config["data"]["val_ratio"])
     test_ratio = float(config["data"]["test_ratio"])
+    augment_with_synthetic = bool(config["data"].get("augment_with_synthetic", False))
+    synthetic_vuln_repeat = int(config["data"].get("synthetic_vuln_repeat", 20))
+    synthetic_safe_repeat = int(config["data"].get("synthetic_safe_repeat", 5))
 
     ensure_dir(processed_dir)
 
     funcs, labels = load_diversevul_data(raw_dir=raw_dir, seed=seed, target_size=18000)
     split_data = split_dataset(funcs, labels, train_ratio, val_ratio, test_ratio, seed)
 
+    if augment_with_synthetic:
+        train_funcs, train_labels = split_data["train"]
+        train_funcs, train_labels = augment_train_with_synthetic(
+            train_funcs=list(train_funcs),
+            train_labels=list(train_labels),
+            vuln_repeat=synthetic_vuln_repeat,
+            safe_repeat=synthetic_safe_repeat,
+        )
+        split_data["train"] = (train_funcs, train_labels)
+        print(
+            "Synthetic augmentation enabled. "
+            f"Added {len(SYNTHETIC_VULNERABLE) * synthetic_vuln_repeat} vulnerable and "
+            f"{len(SYNTHETIC_SAFE) * synthetic_safe_repeat} safe synthetic samples to train split."
+        )
+
     tokenized = {}
+    split_features: Dict[str, List[List[float]]] = {}
     for split_name, (split_funcs, _) in split_data.items():
-        tokenized[split_name] = [
-            preprocess_tokens(code)
-            for code in tqdm(split_funcs, desc=f"Tokenizing {split_name}", unit="func")
-        ]
+        split_tokens: List[List[str]] = []
+        split_feat_rows: List[List[float]] = []
+        for code in tqdm(split_funcs, desc=f"Tokenizing {split_name}", unit="func"):
+            split_tokens.append(preprocess_tokens(code))
+            split_feat_rows.append(extract_vulnerability_features(code))
+        tokenized[split_name] = split_tokens
+        split_features[split_name] = split_feat_rows
 
     vocab = build_vocab(tokenized["train"], max_vocab_size=vocab_size)
 
@@ -379,6 +735,7 @@ def preprocess_and_save(config_path: str = "configs/config.yaml") -> None:
         data_dict = encode_and_pad(
             token_lists=tokenized[split_name],
             labels=split_labels,
+            feature_lists=split_features[split_name],
             vocab=vocab,
             max_seq_len=max_seq_len,
         )

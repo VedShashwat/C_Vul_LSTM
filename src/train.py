@@ -6,18 +6,36 @@ from typing import Dict
 import numpy as np
 import torch
 import torch.nn as nn
-from sklearn.metrics import accuracy_score, f1_score
+from sklearn.metrics import accuracy_score, f1_score, precision_recall_fscore_support
 from torch.optim import Adam
 from torch.optim.lr_scheduler import LambdaLR
 from tqdm import tqdm
 
-from src.utils import FocalLoss, ensure_dir, resolve_device, save_checkpoint
+from src.utils import AsymmetricLoss, FocalLoss, ensure_dir, resolve_device, save_checkpoint
 
 
 def _extract_logits(model_output: torch.Tensor):
     if isinstance(model_output, tuple):
         return model_output[0]
     return model_output
+
+
+def _unpack_batch(batch, device):
+    sequences = batch[0].to(device, non_blocking=True)
+    labels = batch[1].float().to(device, non_blocking=True)
+    vuln_features = None
+    if len(batch) > 2:
+        vuln_features = batch[2].float().to(device, non_blocking=True)
+    return sequences, labels, vuln_features
+
+
+def _forward_model(model, sequences: torch.Tensor, vuln_features: torch.Tensor | None):
+    if vuln_features is not None:
+        try:
+            return model(sequences, vuln_features=vuln_features)
+        except TypeError:
+            return model(sequences)
+    return model(sequences)
 
 
 def get_cosine_schedule_with_warmup(optimizer, num_warmup_steps, num_training_steps, min_lr=1e-6):
@@ -45,7 +63,14 @@ def train_model(
     device = resolve_device(train_cfg.get("device", "cpu"))
     model = model.to(device)
 
-    if use_focal_loss:
+    if bool(train_cfg.get("use_asymmetric_loss", True)):
+        criterion = AsymmetricLoss(
+            gamma_neg=float(train_cfg.get("asym_gamma_neg", 4.0)),
+            gamma_pos=float(train_cfg.get("asym_gamma_pos", 0.0)),
+            clip=float(train_cfg.get("asym_clip", 0.05)),
+            reduction="mean",
+        )
+    elif use_focal_loss:
         criterion = FocalLoss(
             alpha=float(train_cfg.get("focal_alpha", 0.25)),
             gamma=float(train_cfg.get("focal_gamma", 2.0)),
@@ -76,9 +101,12 @@ def train_model(
         "val_loss": [],
         "val_accuracy": [],
         "val_f1": [],
+        "val_recall_vuln": [],
+        "val_score": [],
     }
 
     best_val_loss = float("inf")
+    best_val_score = float("-inf")
     best_state = deepcopy(model.state_dict())
     best_epoch = -1
     patience_counter = 0
@@ -91,12 +119,11 @@ def train_model(
         running_loss = 0.0
 
         train_bar = tqdm(train_loader, desc=f"{model_name} | Epoch {epoch}/{epochs} [Train]", leave=False)
-        for sequences, labels in train_bar:
-            sequences = sequences.to(device, non_blocking=True)
-            labels = labels.float().to(device, non_blocking=True)
+        for batch in train_bar:
+            sequences, labels, vuln_features = _unpack_batch(batch, device)
 
             optimizer.zero_grad(set_to_none=True)
-            logits = _extract_logits(model(sequences))
+            logits = _extract_logits(_forward_model(model, sequences, vuln_features))
             loss = criterion(logits, labels)
             loss.backward()
 
@@ -117,11 +144,10 @@ def train_model(
 
         val_bar = tqdm(val_loader, desc=f"{model_name} | Epoch {epoch}/{epochs} [Val]", leave=False)
         with torch.no_grad():
-            for sequences, labels in val_bar:
-                sequences = sequences.to(device, non_blocking=True)
-                labels = labels.float().to(device, non_blocking=True)
+            for batch in val_bar:
+                sequences, labels, vuln_features = _unpack_batch(batch, device)
 
-                logits = _extract_logits(model(sequences))
+                logits = _extract_logits(_forward_model(model, sequences, vuln_features))
                 loss = criterion(logits, labels)
 
                 probs = torch.sigmoid(logits)
@@ -135,7 +161,14 @@ def train_model(
 
         val_loss = val_running_loss / len(val_loader.dataset)
         val_accuracy = accuracy_score(all_val_labels, all_val_preds)
-        val_f1 = f1_score(all_val_labels, all_val_preds, average="macro", zero_division=0)
+        val_f1 = f1_score(all_val_labels, all_val_preds, average="binary", zero_division=0)
+        _, val_recall_vuln, _, _ = precision_recall_fscore_support(
+            all_val_labels,
+            all_val_preds,
+            average="binary",
+            zero_division=0,
+        )
+        val_score = (0.4 * float(val_f1)) + (0.6 * float(val_recall_vuln))
 
         if not np.isfinite(val_loss):
             print(f"[{model_name}] Non-finite val_loss detected ({val_loss}); skipping checkpoint update.")
@@ -149,15 +182,23 @@ def train_model(
         history["val_loss"].append(float(val_loss))
         history["val_accuracy"].append(float(val_accuracy))
         history["val_f1"].append(float(val_f1))
+        history["val_recall_vuln"].append(float(val_recall_vuln))
+        history["val_score"].append(float(val_score))
 
         print(
             f"[{model_name}] Epoch {epoch}/{epochs} | "
             f"train_loss={train_loss:.4f} | val_loss={val_loss:.4f} | "
-            f"val_acc={val_accuracy:.4f} | val_f1={val_f1:.4f}"
+            f"val_acc={val_accuracy:.4f} | val_f1={val_f1:.4f} | "
+            f"val_recall_vuln={val_recall_vuln:.4f} | val_score={val_score:.4f}"
         )
 
-        if val_loss < best_val_loss:
+        improved = (val_score > best_val_score + 1e-8) or (
+            abs(val_score - best_val_score) <= 1e-8 and val_loss < best_val_loss
+        )
+
+        if improved:
             best_val_loss = val_loss
+            best_val_score = val_score
             best_state = deepcopy(model.state_dict())
             best_epoch = epoch
             patience_counter = 0
@@ -170,6 +211,8 @@ def train_model(
                     "val_loss": float(val_loss),
                     "val_accuracy": float(val_accuracy),
                     "val_f1": float(val_f1),
+                    "val_recall_vuln": float(val_recall_vuln),
+                    "val_score": float(val_score),
                 },
                 checkpoint_path=checkpoint_path,
             )

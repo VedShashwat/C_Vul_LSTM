@@ -99,3 +99,49 @@ class FocalLoss(nn.Module):
         if self.reduction == "mean":
             return loss.mean()
         return loss.sum()
+
+
+class AsymmetricLoss(nn.Module):
+    """
+    Asymmetric loss for imbalanced binary classification.
+    gamma_neg > gamma_pos aggressively down-weights easy negatives.
+    """
+
+    def __init__(
+        self,
+        gamma_neg: float = 4.0,
+        gamma_pos: float = 0.0,
+        clip: float = 0.05,
+        eps: float = 1e-8,
+        reduction: str = "mean",
+    ) -> None:
+        super().__init__()
+        self.gamma_neg = gamma_neg
+        self.gamma_pos = gamma_pos
+        self.clip = clip
+        self.eps = eps
+        self.reduction = reduction
+
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        targets = targets.float()
+
+        p = torch.sigmoid(logits)
+        p_pos = p
+        p_neg = 1.0 - p
+
+        if self.clip and self.clip > 0:
+            p_neg = (p_neg + self.clip).clamp(max=1.0)
+
+        loss_pos = targets * torch.log(p_pos.clamp(min=self.eps, max=1.0))
+        loss_neg = (1.0 - targets) * torch.log(p_neg.clamp(min=self.eps, max=1.0))
+        loss = loss_pos + loss_neg
+
+        if self.gamma_neg > 0 or self.gamma_pos > 0:
+            pt = p_pos * targets + p_neg * (1.0 - targets)
+            gamma = self.gamma_pos * targets + self.gamma_neg * (1.0 - targets)
+            loss = loss * torch.pow(1.0 - pt, gamma)
+
+        loss = -loss
+        if self.reduction == "mean":
+            return loss.mean()
+        return loss.sum()

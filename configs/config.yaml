@@ -3,13 +3,17 @@ data:
   processed_dir: data/processed
   max_seq_len: 500
   vocab_size: 10000
+  vuln_feature_dim: 32
   train_ratio: 0.70
   val_ratio: 0.15
   test_ratio: 0.15
+  augment_with_synthetic: true
+  synthetic_vuln_repeat: 20
+  synthetic_safe_repeat: 5
 
 model:
-  embed_dim: 128
-  hidden_size: 128
+  embed_dim: 256
+  hidden_size: 256
   num_layers: 2
   dropout: 0.3
   attention_dim: 64
@@ -18,7 +22,7 @@ model:
   num_attention_heads: 4
 
 training:
-  batch_size: 64
+  batch_size: 32
   lr: 0.001
   epochs: 20
   patience: 4
@@ -30,6 +34,11 @@ training:
   focal_gamma: 2.0
   use_warmup_cosine: true
   oversample_factor: 2.5
+  use_balanced_batch_sampler: true
+  use_asymmetric_loss: true
+  asym_gamma_neg: 4.0
+  asym_gamma_pos: 0.0
+  asym_clip: 0.05
 
 evaluation:
   threshold_objective: f2

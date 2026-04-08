@@ -74,6 +74,7 @@ def _build_model_from_config(model_name: str, config: Dict, vocab_size: int, pad
         cnn_num_filters=int(config["model"].get("cnn_num_filters", 128)),
         cnn_kernel_sizes=config["model"].get("cnn_kernel_sizes", [3, 5, 7]),
         num_attention_heads=int(config["model"].get("num_attention_heads", 4)),
+        vuln_feature_dim=int(config["data"].get("vuln_feature_dim", 32)),
     )
 
 

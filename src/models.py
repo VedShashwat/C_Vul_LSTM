@@ -1,4 +1,4 @@
-from typing import Sequence, Tuple
+from typing import Optional, Sequence, Tuple
 
 import torch
 import torch.nn as nn
@@ -6,6 +6,26 @@ import torch.nn as nn
 
 def _lstm_dropout(num_layers: int, dropout: float) -> float:
     return dropout if num_layers > 1 else 0.0
+
+
+def _concat_vuln_features(
+    seq_repr: torch.Tensor,
+    vuln_features: Optional[torch.Tensor],
+    feature_dim: int,
+) -> torch.Tensor:
+    if vuln_features is None:
+        feat = torch.zeros(seq_repr.size(0), feature_dim, device=seq_repr.device, dtype=seq_repr.dtype)
+    else:
+        feat = vuln_features.to(seq_repr.device, dtype=seq_repr.dtype)
+        if feat.dim() == 1:
+            feat = feat.unsqueeze(0)
+        if feat.size(1) != feature_dim:
+            if feat.size(1) > feature_dim:
+                feat = feat[:, :feature_dim]
+            else:
+                pad = torch.zeros(feat.size(0), feature_dim - feat.size(1), device=feat.device, dtype=feat.dtype)
+                feat = torch.cat([feat, pad], dim=1)
+    return torch.cat([seq_repr, feat], dim=1)
 
 
 class VanillaLSTM(nn.Module):
@@ -17,8 +37,10 @@ class VanillaLSTM(nn.Module):
         num_layers: int,
         dropout: float,
         pad_idx: int,
+        vuln_feature_dim: int = 32,
     ) -> None:
         super().__init__()
+        self.vuln_feature_dim = vuln_feature_dim
         self.embedding = nn.Embedding(vocab_size, embed_dim, padding_idx=pad_idx)
         self.lstm = nn.LSTM(
             input_size=embed_dim,
@@ -28,13 +50,16 @@ class VanillaLSTM(nn.Module):
             dropout=_lstm_dropout(num_layers, dropout),
             bidirectional=False,
         )
-        self.fc = nn.Linear(hidden_size, 1)
+        self.seq_proj = nn.Linear(hidden_size, hidden_size * 2)
+        self.fc = nn.Linear((hidden_size * 2) + vuln_feature_dim, 1)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, vuln_features: Optional[torch.Tensor] = None) -> torch.Tensor:
         emb = self.embedding(x)
         _, (h_n, _) = self.lstm(emb)
         seq_repr = h_n[-1]
-        logits = self.fc(seq_repr).squeeze(-1)
+        seq_repr = self.seq_proj(seq_repr)
+        fused = _concat_vuln_features(seq_repr, vuln_features, self.vuln_feature_dim)
+        logits = self.fc(fused).squeeze(-1)
         return logits
 
 
@@ -47,8 +72,10 @@ class BiLSTM(nn.Module):
         num_layers: int,
         dropout: float,
         pad_idx: int,
+        vuln_feature_dim: int = 32,
     ) -> None:
         super().__init__()
+        self.vuln_feature_dim = vuln_feature_dim
         self.embedding = nn.Embedding(vocab_size, embed_dim, padding_idx=pad_idx)
         self.lstm = nn.LSTM(
             input_size=embed_dim,
@@ -58,17 +85,18 @@ class BiLSTM(nn.Module):
             dropout=_lstm_dropout(num_layers, dropout),
             bidirectional=True,
         )
-        self.fc = nn.Linear(hidden_size * 2, 1)
+        self.fc = nn.Linear((hidden_size * 2) + vuln_feature_dim, 1)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, vuln_features: Optional[torch.Tensor] = None) -> torch.Tensor:
         emb = self.embedding(x)
         _, (h_n, _) = self.lstm(emb)
 
         forward_final = h_n[-2]
         backward_final = h_n[-1]
         seq_repr = torch.cat([forward_final, backward_final], dim=1)
+        fused = _concat_vuln_features(seq_repr, vuln_features, self.vuln_feature_dim)
 
-        logits = self.fc(seq_repr).squeeze(-1)
+        logits = self.fc(fused).squeeze(-1)
         return logits
 
 
@@ -82,9 +110,11 @@ class BiLSTMAttention(nn.Module):
         dropout: float,
         pad_idx: int,
         attention_dim: int = 64,
+        vuln_feature_dim: int = 32,
     ) -> None:
         super().__init__()
         self.pad_idx = pad_idx
+        self.vuln_feature_dim = vuln_feature_dim
 
         self.embedding = nn.Embedding(vocab_size, embed_dim, padding_idx=pad_idx)
         self.lstm = nn.LSTM(
@@ -98,9 +128,13 @@ class BiLSTMAttention(nn.Module):
 
         self.attn_proj = nn.Linear(hidden_size * 2, attention_dim)
         self.attn_score = nn.Linear(attention_dim, 1)
-        self.fc = nn.Linear(hidden_size * 2, 1)
+        self.fc = nn.Linear((hidden_size * 2) + vuln_feature_dim, 1)
 
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(
+        self,
+        x: torch.Tensor,
+        vuln_features: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         emb = self.embedding(x)
         outputs, _ = self.lstm(emb)
 
@@ -116,7 +150,8 @@ class BiLSTMAttention(nn.Module):
         alpha = torch.softmax(attn_logits, dim=1)
 
         context = torch.bmm(alpha.unsqueeze(1), outputs).squeeze(1)
-        logits = self.fc(context).squeeze(-1)
+        fused = _concat_vuln_features(context, vuln_features, self.vuln_feature_dim)
+        logits = self.fc(fused).squeeze(-1)
 
         return logits, alpha
 
@@ -137,8 +172,10 @@ class CNN_BiLSTM(nn.Module):
         pad_idx: int,
         cnn_num_filters: int = 128,
         cnn_kernel_sizes: Sequence[int] = (3, 5, 7),
+        vuln_feature_dim: int = 32,
     ) -> None:
         super().__init__()
+        self.vuln_feature_dim = vuln_feature_dim
         self.embedding = nn.Embedding(vocab_size, embed_dim, padding_idx=pad_idx)
         self.embed_dropout = nn.Dropout(0.2)
 
@@ -160,10 +197,10 @@ class CNN_BiLSTM(nn.Module):
         fusion_in_dim = cnn_out_dim + (hidden_size * 2)
 
         self.fusion_dropout = nn.Dropout(dropout)
-        self.fusion_fc = nn.Linear(fusion_in_dim, hidden_size)
-        self.fc = nn.Linear(hidden_size, 1)
+        self.fusion_fc = nn.Linear(fusion_in_dim, hidden_size * 2)
+        self.fc = nn.Linear((hidden_size * 2) + vuln_feature_dim, 1)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, vuln_features: Optional[torch.Tensor] = None) -> torch.Tensor:
         emb = self.embed_dropout(self.embedding(x))
 
         conv_in = emb.transpose(1, 2)
@@ -180,6 +217,7 @@ class CNN_BiLSTM(nn.Module):
         fused = torch.cat([cnn_out, lstm_out], dim=1)
         fused = self.fusion_dropout(fused)
         fused = torch.relu(self.fusion_fc(fused))
+        fused = _concat_vuln_features(fused, vuln_features, self.vuln_feature_dim)
         logits = self.fc(fused).squeeze(-1)
         return logits
 
@@ -198,9 +236,11 @@ class BiLSTM_MultiHeadAttention(nn.Module):
         dropout: float,
         pad_idx: int,
         num_attention_heads: int = 4,
+        vuln_feature_dim: int = 32,
     ) -> None:
         super().__init__()
         self.pad_idx = pad_idx
+        self.vuln_feature_dim = vuln_feature_dim
         self.embedding = nn.Embedding(vocab_size, embed_dim, padding_idx=pad_idx)
         self.lstm = nn.LSTM(
             input_size=embed_dim,
@@ -220,11 +260,15 @@ class BiLSTM_MultiHeadAttention(nn.Module):
 
         self.norm = nn.LayerNorm(hidden_size * 2)
         self.dropout = nn.Dropout(dropout)
-        self.proj = nn.Linear(hidden_size * 2, hidden_size)
+        self.proj = nn.Linear(hidden_size * 2, hidden_size * 2)
         self.act = nn.GELU()
-        self.fc = nn.Linear(hidden_size, 1)
+        self.fc = nn.Linear((hidden_size * 2) + vuln_feature_dim, 1)
 
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(
+        self,
+        x: torch.Tensor,
+        vuln_features: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         emb = self.embedding(x)
         outputs, _ = self.lstm(emb)
 
@@ -251,6 +295,7 @@ class BiLSTM_MultiHeadAttention(nn.Module):
 
         pooled = self.norm(pooled)
         hidden = self.act(self.proj(self.dropout(pooled)))
+        hidden = _concat_vuln_features(hidden, vuln_features, self.vuln_feature_dim)
         logits = self.fc(hidden).squeeze(-1)
         return logits, attn_weights
 
@@ -267,13 +312,14 @@ def build_model(
     cnn_num_filters: int = 128,
     cnn_kernel_sizes: Sequence[int] = (3, 5, 7),
     num_attention_heads: int = 4,
+    vuln_feature_dim: int = 32,
 ) -> nn.Module:
     name = model_name.lower()
 
     if name == "lstm":
-        return VanillaLSTM(vocab_size, embed_dim, hidden_size, num_layers, dropout, pad_idx)
+        return VanillaLSTM(vocab_size, embed_dim, hidden_size, num_layers, dropout, pad_idx, vuln_feature_dim)
     if name == "bilstm":
-        return BiLSTM(vocab_size, embed_dim, hidden_size, num_layers, dropout, pad_idx)
+        return BiLSTM(vocab_size, embed_dim, hidden_size, num_layers, dropout, pad_idx, vuln_feature_dim)
     if name == "bilstm_attn":
         return BiLSTMAttention(
             vocab_size,
@@ -283,6 +329,7 @@ def build_model(
             dropout,
             pad_idx,
             attention_dim=attention_dim,
+            vuln_feature_dim=vuln_feature_dim,
         )
     if name == "cnn_bilstm":
         return CNN_BiLSTM(
@@ -294,6 +341,7 @@ def build_model(
             pad_idx,
             cnn_num_filters=cnn_num_filters,
             cnn_kernel_sizes=cnn_kernel_sizes,
+            vuln_feature_dim=vuln_feature_dim,
         )
     if name == "bilstm_multihead":
         return BiLSTM_MultiHeadAttention(
@@ -304,6 +352,7 @@ def build_model(
             dropout,
             pad_idx,
             num_attention_heads=num_attention_heads,
+            vuln_feature_dim=vuln_feature_dim,
         )
 
     raise ValueError(f"Unknown model name: {model_name}")
