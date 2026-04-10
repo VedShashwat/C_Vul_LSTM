@@ -1,8 +1,9 @@
 import argparse
 import json
 import math
+import re
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Tuple
 
 import torch
 
@@ -104,11 +105,161 @@ def _sigmoid_scalar(x: float) -> float:
     return 1.0 / (1.0 + math.exp(-x))
 
 
+def should_hard_block_veto(code: str) -> Tuple[bool, str | None]:
+    """Never allow veto when clearly dangerous sink patterns are present."""
+    never_veto_if_present = ["gets", "strcpy", "sprintf", "scanf", "system", "popen", "alloca"]
+    for fn in never_veto_if_present:
+        if re.search(r"\b" + re.escape(fn) + r"\s*\(", code):
+            return True, fn
+    if re.search(r"\bprintf\s*\(\s*[^\s\"'%\n]", code):
+        return True, "untrusted_format"
+    if re.search(r"\bfprintf\s*\(\s*[^,]+,\s*[^\s\"'%\n]", code):
+        return True, "untrusted_format"
+    return False, None
+
+
+def safety_veto(code: str, ensemble_pred: int, ensemble_prob: float) -> tuple[int, str]:
+    """
+    Deterministic post-processing veto.
+    If ensemble says VULNERABLE but code exhibits clear safety patterns,
+    override to SAFE. Returns (final_pred, veto_reason).
+    """
+    if ensemble_pred == 0:
+        return 0, "no_veto"
+
+    blocked, blocked_reason = should_hard_block_veto(code)
+    if blocked:
+        return 1, f"hard_block({blocked_reason})"
+
+    safety_signals: List[str] = []
+
+    # Signal 1: Explicit bounded copy with sizeof.
+    if re.search(
+        r"\b(snprintf|strncpy|strncat)\s*\([^,]+,\s*sizeof|"
+        r"\bmemcpy\s*\([^,]+,[^,]+,\s*sizeof",
+        code,
+    ):
+        safety_signals.append("bounded_copy_sizeof")
+
+    # Signal 2: Null pointer guard before use.
+    if re.search(
+        r"if\s*\(\s*!\s*\w+\s*\)\s*(return|\{)|"
+        r"if\s*\(\s*\w+\s*==\s*NULL\s*\)\s*(return|\{)",
+        code,
+    ):
+        safety_signals.append("null_guard")
+
+    # Signal 3: Explicit size bound checks.
+    if re.search(
+        r"if\s*\([^)]*\b(len|size|length|count|n)\b[^)]*[<>]=?\s*\d|"
+        r"if\s*\(\s*\d+\s*[<>]=?\s*[^)]*\b(len|size|length)\b",
+        code,
+    ):
+        safety_signals.append("explicit_size_check")
+
+    # Signal 4: Path normalization / validation hints.
+    if re.search(
+        r"\b(realpath|canonicalize_file_name|basename|dirname)\s*\(",
+        code,
+    ):
+        safety_signals.append("path_validated")
+
+    # Signal 5: Path input sanitization against traversal.
+    if (
+        re.search(r"\b\w+\s*\[\s*\w+\s*\]\s*==\s*'/'", code)
+        and re.search(r"==\s*'\.'\s*&&[^\n]*\+\s*1\s*\]\s*==\s*'\.'", code)
+    ):
+        safety_signals.append("path_input_sanitized")
+
+    # Signal 6: Whitelist / validation gate.
+    if re.search(
+        r"\b(isalnum|isdigit|isalpha|isprint)\s*\(|"
+        r"(whitelist|allowlist|sanitize|validate)\s*\(",
+        code,
+        re.IGNORECASE,
+    ):
+        safety_signals.append("input_validated")
+
+    # Signal 7: Safe tempfile construction pattern.
+    if re.search(r"O_CREAT.*O_EXCL|O_EXCL.*O_CREAT|mkstemp\s*\(", code):
+        safety_signals.append("safe_tempfile")
+
+    # Signal 8: Safe exec dispatch without shell command composition.
+    if (
+        re.search(r"\b(execv|execve|execl)\s*\(", code)
+        and not re.search(r"\b(system|popen)\s*\(", code)
+        and not re.search(r"(sprintf|snprintf|strcat|strcpy)[^;]+cmd", code)
+    ):
+        safety_signals.append("safe_exec_dispatch")
+
+    # Signal 9: Literal format string usage.
+    has_literal_format = bool(
+        re.search(r"\bprintf\s*\(\s*\"", code)
+        or re.search(r"\bfprintf\s*\(\s*[^,]+,\s*\"", code)
+        or re.search(r"\bsyslog\s*\(\s*\"", code)
+    )
+    has_untrusted_format = bool(
+        re.search(r"\bprintf\s*\(\s*[^\s\"'%\n]", code)
+        or re.search(r"\bfprintf\s*\(\s*[^,]+,\s*[^\s\"'%\n]", code)
+    )
+    if has_literal_format and not has_untrusted_format:
+        safety_signals.append("literal_format_string")
+
+    # Signal 10: Read-only token scan loop (no buffer writes).
+    if (
+        re.search(r"while\s*\([^)]*!=\s*'\\0'[^)]*\)", code)
+        and not re.search(r"\w+\s*\[\s*\w+\s*\]\s*=\s*[^=]", code)
+        and re.search(r"return\s*-?1\s*;", code)
+    ):
+        safety_signals.append("read_only_scan")
+
+    # Signal 11: Bounded character copy loop with explicit null termination.
+    if (
+        re.search(r"\w+\s*\[\s*\w+\s*\]\s*=\s*\w+\s*\[\s*\w+\s*\]", code)
+        and re.search(r"\b\w+\s*<\s*\d+", code)
+        and not re.search(r"\b\w+\s*<=\s*\d+", code)
+        and re.search(r"\w+\s*\[\s*\w+\s*\]\s*=\s*'\\0'", code)
+    ):
+        safety_signals.append("strict_bounded_copy_loop")
+
+    # Signal 12: Delimiter-aware bounded token parser pattern.
+    if (
+        re.search(r"!=\s*'='", code)
+        and re.search(r"\b\w+\s*<\s*\d+", code)
+        and not re.search(r"\b\w+\s*<=\s*\d+", code)
+        and re.search(r"\w+\s*\[\s*\w+\s*\]\s*=\s*\w+\s*\[\s*\w+\s*\]", code)
+        and re.search(r"\w+\s*\[\s*\w+\s*\]\s*=\s*'\\0'", code)
+    ):
+        safety_signals.append("delimiter_bounded_parser")
+
+    # High-confidence override is only allowed for very strong safety signatures.
+    strong_combo_override = (
+        ("bounded_copy_sizeof" in safety_signals and "path_input_sanitized" in safety_signals)
+        or ("literal_format_string" in safety_signals and "strict_bounded_copy_loop" in safety_signals)
+        or ("strict_bounded_copy_loop" in safety_signals and "delimiter_bounded_parser" in safety_signals)
+        or ("safe_tempfile" in safety_signals)
+        or ("safe_exec_dispatch" in safety_signals)
+    )
+
+    if ensemble_prob >= 0.85 and not strong_combo_override:
+        return 1, "no_veto"
+
+    if len(safety_signals) >= 2:
+        return 0, f"safety_veto({','.join(safety_signals)})"
+
+    strong_singles = {"safe_tempfile", "safe_exec_dispatch", "read_only_scan"}
+    if len(safety_signals) == 1 and safety_signals[0] in strong_singles:
+        return 0, f"safety_veto({safety_signals[0]})"
+
+    return 1, "no_veto"
+
+
 def main() -> None:
     args = parse_args()
     config = load_config(args.config)
 
-    code_str = ensure_function_body(_load_code(args))
+    original_code_str = _load_code(args)
+    code_str = ensure_function_body(original_code_str)
 
     processed_dir = Path(config["data"]["processed_dir"])
     results_dir = Path(config["results_dir"])
@@ -191,7 +342,15 @@ def main() -> None:
         prob_vuln = _predict_single_model(model, seq, vuln_features=vuln_feat_tensor)
         decision_threshold = thresholds.get(args.model, 0.5)
 
-    if prob_vuln >= decision_threshold:
+    if args.model == "ensemble":
+        ensemble_pred = 1 if prob_vuln >= decision_threshold else 0
+        final_pred, veto_reason = safety_veto(original_code_str, ensemble_pred, prob_vuln)
+        if veto_reason != "no_veto":
+            print(f"  [Safety veto applied: {veto_reason}]")
+    else:
+        final_pred = 1 if prob_vuln >= decision_threshold else 0
+
+    if final_pred == 1:
         print(f"Prediction: VULNERABLE (confidence: {prob_vuln * 100:.1f}%, threshold: {decision_threshold:.2f})")
     else:
         print(f"Prediction: SAFE (confidence: {(1 - prob_vuln) * 100:.1f}%, threshold: {decision_threshold:.2f})")
