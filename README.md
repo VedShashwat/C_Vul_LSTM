@@ -9,7 +9,7 @@ Current model suite:
 - `bilstm_attn` (Bi-LSTM + token attention)
 - `cnn_bilstm`
 - `bilstm_multihead` (Bi-LSTM + multi-head self-attention)
-- `ensemble` (soft-voting across all 5 models)
+- `ensemble` (quorum-vote across all 5 models, with inference-time safety veto)
 
 Dataset note:
 
@@ -97,6 +97,13 @@ Evaluation only (load checkpoints, tune thresholds on val, evaluate test):
 python main.py --eval-only
 ```
 
+Benchmark suites (ensemble):
+
+```bash
+python run_benchmark.py --suite data/snippets_v2 --model ensemble --save-json
+python run_benchmark.py --suite data/snippets_v3 --model ensemble --save-json
+```
+
 Other options:
 
 ```bash
@@ -121,6 +128,7 @@ python inference.py --model ensemble --code "char buf[10]; memcpy(buf, src, strl
 Inference behavior:
 
 - If `--code` is a bare snippet (not a full function), it is automatically wrapped into a demo function body for better context.
+- For ensemble inference, a deterministic post-processing safety veto can override borderline false-positive vulnerable predictions when strong safety patterns are detected.
 
 Supported model names:
 
@@ -147,19 +155,38 @@ Training/evaluation outputs are saved under `results/`:
 - Comparison table: `comparison_table.md`
 - Optimal thresholds: `optimal_thresholds.json`
 - Ensemble reports: `ensemble_report.txt`, `ensemble_best2_report.txt`, `ensemble_majority_report.txt`
+- Benchmark reports: `benchmark_snippets_v2_ensemble_*.json`, `benchmark_snippets_v3_ensemble_*.json`
 
 ## Latest Results (Test Set)
 
-Values below come from `results/comparison_table.md` after retraining with the corrected tokenizer/vocabulary and threshold tuning.
+Values below come from `results/comparison_table.md` after the latest eval-only run.
 
 | Model | Threshold | Accuracy | Precision | Recall | F1 | AUC |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| lstm | 0.78 | 0.8852 | 0.1674 | 0.2516 | 0.2010 | 0.5608 |
-| bilstm | 0.18 | 0.8952 | 0.1981 | 0.2710 | 0.2289 | 0.6606 |
-| bilstm_attn | 0.16 | 0.8645 | 0.1651 | 0.3355 | 0.2213 | 0.7049 |
-| cnn_bilstm | 0.50 | 0.8734 | 0.1742 | 0.3226 | 0.2262 | 0.7076 |
-| bilstm_multihead | 0.24 | 0.7738 | 0.1238 | 0.4839 | 0.1971 | 0.7048 |
-| ensemble | 0.44 | 0.8760 | 0.1875 | 0.3484 | 0.2438 | 0.7291 |
+| lstm | 0.68 | 0.7205 | 0.0935 | 0.4452 | 0.1545 | 0.5506 |
+| bilstm | 0.65 | 0.7564 | 0.1039 | 0.4258 | 0.1671 | 0.6497 |
+| bilstm_attn | 0.61 | 0.5309 | 0.0857 | 0.7419 | 0.1536 | 0.7010 |
+| cnn_bilstm | 0.69 | 0.6757 | 0.0999 | 0.5806 | 0.1705 | 0.7044 |
+| bilstm_multihead | 0.64 | 0.5772 | 0.0842 | 0.6452 | 0.1490 | 0.6676 |
+| ensemble | 0.60 | 0.6746 | 0.1022 | 0.6000 | 0.1746 | 0.6722 |
+
+Ensemble policy snapshot:
+
+- Method: `quorum_vote`
+- Quorum: `3`
+- Objective: `f2`
+
+## Latest Benchmark Results
+
+Latest benchmark artifacts:
+
+- `results/benchmark_snippets_v2_ensemble_20260411_145850.json`
+- `results/benchmark_snippets_v3_ensemble_20260411_145858.json`
+
+Scores:
+
+- v2: `10/10` (TP 5, TN 5, FP 0, FN 0)
+- v3: `10/10` (TP 5, TN 5, FP 0, FN 0)
 
 ## Report Context
 
