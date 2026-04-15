@@ -104,6 +104,16 @@ python run_benchmark.py --suite data/snippets_v2 --model ensemble --save-json
 python run_benchmark.py --suite data/snippets_v3 --model ensemble --save-json
 ```
 
+Faculty demo runner (overall + per-model + v2/v3/v4 suites):
+
+```bash
+python demo.py --show-ensemble-failures --save-json
+```
+
+This prints a compact table for each suite, an overall aggregate table across suites,
+prints the standard test-set model metrics from `results/comparison_table.md` in terminal,
+and saves a full JSON artifact to `results/demo_*.json`.
+
 Other options:
 
 ```bash
