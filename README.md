@@ -104,7 +104,7 @@ python run_benchmark.py --suite data/snippets_v2 --model ensemble --save-json
 python run_benchmark.py --suite data/snippets_v3 --model ensemble --save-json
 ```
 
-Faculty demo runner (overall + per-model + v2/v3/v4 suites):
+Demo runner (overall + per-model + v2/v3/v4 suites):
 
 ```bash
 python demo.py --show-ensemble-failures --save-json
