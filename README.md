@@ -198,6 +198,9 @@ Scores:
 - v2: `10/10` (TP 5, TN 5, FP 0, FN 0)
 - v3: `10/10` (TP 5, TN 5, FP 0, FN 0)
 
+
+NOTE: This is the updated branch, main does not contain the final useful model
+
 ## Report Context
 
 - The vanilla LSTM baseline is intentionally weaker and serves as the comparison anchor.
